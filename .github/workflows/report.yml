@@ -1,0 +1,325 @@
+# Aggregation and publishing.
+#
+# Triggered once each morning by schedule, manually by workflow_dispatch,
+# or optionally from scan.yml by workflow_call when a manual scan is run
+# with the run_report checkbox selected.
+#
+# It is intentionally not triggered by workflow_run. Automated scans and
+# reports are separate by default.
+#
+# Steps, in order:
+#   1. aggregate       : computes summaries from data/, writes docs/
+#   2. prune           : removes page-level detail older than retention_weeks
+#   3. commit          : writes summaries and retention marker back to data/
+#                        (data/ is a checkout of the data repo, `data_repo`
+#                        in config/targets.yml; pushed with VITAL_DATA_DEPLOY_KEY)
+#   4. generate comment: creates docs/comment.md
+#   5. deploy          : publishes docs/ to GitHub Pages
+#   6. post comment    : posts weekly Markdown summary to a pinned issue
+
+name: report
+
+on:
+  schedule:
+    # GitHub cron is UTC. 12:37 UTC is roughly 08:37 ET during daylight
+    # saving time and 07:37 ET during standard time.
+    - cron: '37 12 * * *'
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+  issues: write
+
+concurrency:
+  group: report
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.decide.outputs.publish }}
+      repo_size_kb: ${{ steps.size.outputs.kb }}
+      data_repo: ${{ steps.datarepo.outputs.repo }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          sparse-checkout: |
+            src
+            scripts
+            config
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 26
+
+      # The gate only needs three small marker files from the data repo, so
+      # it reads them through the API instead of checking out ~1.5 GB.
+      - id: datarepo
+        name: Read data repo markers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          npm ci --omit=optional --ignore-scripts
+          REPO=$(node scripts/data-repo.js)
+          echo "repo=${REPO}" >> "$GITHUB_OUTPUT"
+          mkdir -p data
+          for f in .repo-size-kb .repo-size-history .last-report-date; do
+            gh api "repos/${REPO}/contents/${f}" -H "Accept: application/vnd.github.raw" > "data/${f}" 2>/dev/null || rm -f "data/${f}"
+          done
+
+      # Data-in-git growth watchdog (ROADMAP-2026-07.md Mission B3). The
+      # 1 GB static threshold this used to check was a one-time trigger —
+      # it fired 2026-07-14, the write-pattern fix in that mission landed
+      # (aggregate.js / ledger modules no longer rewrite unchanged data),
+      # and existing history doesn't shrink on its own. A static "still
+      # over 1 GB" check would now warn every single day forever, which is
+      # just noise. Instead: compare against the size recorded on the
+      # LAST run (data/.repo-size-kb, written by the commit step below) and
+      # warn only on fast renewed growth — that's the signal the
+      # write-pattern fix stopped working or a new bloat source appeared,
+      # not "the repo is still as big as it was."
+      #
+      # Run-over-run alone missed steady growth: 128 MB → 2.4 GB between
+      # July and October 2026 at ~25 MB/day never crossed 50 MB per run
+      # (it was committed crawl state; now a release asset). So also
+      # compare against ~7 days ago (data/.repo-size-history) and against
+      # an absolute ceiling. The ceiling sits ~330 MB above the size after
+      # the 2026-10-13 rewrite (~970 MB); lower it after any history rewrite.
+      #
+      # Since data/ moved to the data repo, growth is tracked there; this
+      # code repo only gets a ceiling (CODE_CEILING_MB). data/ history was
+      # purged from it on 2026-10-14 (pack ~5 MB), so 100 MB is a wide margin.
+      - id: size
+        name: Check repository size growth
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DATA_REPO: ${{ steps.datarepo.outputs.repo }}
+          WEEKLY_GROWTH_LIMIT_MB: 100
+          CEILING_MB: 1300
+          CODE_CEILING_MB: 100
+        run: |
+          CODE_MB=$(( $(gh api "repos/${GITHUB_REPOSITORY}" --jq .size) / 1024 ))
+          echo "Code repository size: ~${CODE_MB} MB"
+          if [ "$CODE_MB" -gt "$CODE_CEILING_MB" ]; then
+            echo "::warning title=Code repo over size ceiling::${GITHUB_REPOSITORY} is ~${CODE_MB} MB, over the ${CODE_CEILING_MB} MB ceiling. Scan data belongs in ${DATA_REPO}."
+          fi
+          KB=$(gh api "repos/${DATA_REPO}" --jq .size)
+          MB=$((KB / 1024))
+          echo "Data repository size (server-side, full history): ${KB} KB (~${MB} MB)"
+          # GitHub reports 0 until it has sized a repo (e.g. a new one), so
+          # 0 is "unknown": neither recorded nor compared.
+          if [ "$KB" -eq 0 ]; then
+            echo "Size not computed yet by GitHub; skipping growth checks."
+            exit 0
+          fi
+          echo "kb=${KB}" >> "$GITHUB_OUTPUT"
+          PREV_KB=$(cat data/.repo-size-kb 2>/dev/null || echo "")
+          if [ -n "$PREV_KB" ] && [ "$PREV_KB" -gt 0 ]; then
+            GROWTH_KB=$((KB - PREV_KB))
+            GROWTH_MB=$((GROWTH_KB / 1024))
+            echo "Growth since last run: ${GROWTH_KB} KB (~${GROWTH_MB} MB)"
+            if [ "$GROWTH_MB" -gt 50 ]; then
+              echo "::warning title=Repo growing fast::Repo grew ~${GROWTH_MB} MB since the last report run (now ~${MB} MB). The write-pattern fix (see ARCHITECTURE.md 'Git history policy') may have regressed, or a new bloat source appeared in the data repo."
+            fi
+          else
+            echo "No prior size recorded yet (first run after the watchdog rewrite) — nothing to compare."
+          fi
+          CUTOFF=$(date -u -d '7 days ago' +%Y-%m-%d)
+          BASE=$(awk -v c="$CUTOFF" '$1 <= c && $2 > 0 { d = $1; kb = $2 } END { if (kb) print d, kb }' data/.repo-size-history 2>/dev/null || true)
+          if [ -n "$BASE" ]; then
+            set -- $BASE
+            WEEK_MB=$(( (KB - $2) / 1024 ))
+            echo "Growth since $1: ~${WEEK_MB} MB"
+            if [ "$WEEK_MB" -gt "$WEEKLY_GROWTH_LIMIT_MB" ]; then
+              echo "::warning title=Repo growing steadily::Repo grew ~${WEEK_MB} MB since $1 (limit ${WEEKLY_GROWTH_LIMIT_MB} MB per ~7 days; now ~${MB} MB). Find the path with 'git rev-list --objects --all | git cat-file --batch-check' and check whether something large is being committed every run (see ARCHITECTURE.md 'Git history policy')."
+            fi
+          else
+            echo "No size recorded 7+ days ago yet — weekly growth check starts once data/.repo-size-history has a week of entries."
+          fi
+          if [ "$MB" -gt "$CEILING_MB" ]; then
+            echo "::warning title=Repo over size ceiling::Repo is ~${MB} MB, over the ${CEILING_MB} MB ceiling. Investigate the largest paths in history before it reaches GitHub's soft limits."
+          fi
+
+      - id: decide
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "workflow_call" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            TODAY=$(date -u +%Y-%m-%d)
+            LAST=$(cat data/.last-report-date 2>/dev/null || echo "")
+            if [ "$LAST" = "$TODAY" ]; then
+              echo "skip: already published $TODAY"
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "publish: scheduled report for $TODAY (last=$LAST)"
+              echo "publish=true" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          echo "publish=false" >> "$GITHUB_OUTPUT"
+
+  report:
+    needs: gate
+    if: needs.gate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.page.outputs.page_url }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ needs.gate.outputs.data_repo }}
+          ssh-key: ${{ secrets.VITAL_DATA_DEPLOY_KEY }}
+          path: data
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 26
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --omit=optional --ignore-scripts
+
+      - name: Aggregate
+        run: node src/aggregate.js
+
+      - name: Prune old page-level detail
+        run: node src/prune.js
+
+      - name: Commit summaries and pruning
+        working-directory: data
+        env:
+          REPO_SIZE_KB: ${{ needs.gate.outputs.repo_size_kb }}
+        run: |
+          git config user.name "vital-scans[bot]"
+          git config user.email "vital-scans@users.noreply.github.com"
+          BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+          date -u +%Y-%m-%d > .last-report-date
+          # Size as measured by the gate job at the START of this run — the
+          # growth-watchdog check above compares against this on the NEXT
+          # run, so it's tracking size-at-report-time to size-at-report-time,
+          # not size mid-way through today's own commit.
+          if [ -n "$REPO_SIZE_KB" ]; then
+            echo "$REPO_SIZE_KB" > .repo-size-kb
+            { cat .repo-size-history 2>/dev/null || true
+              echo "$(date -u +%Y-%m-%d) $REPO_SIZE_KB"; } | tail -n 60 > .repo-size-history.tmp
+            mv .repo-size-history.tmp .repo-size-history
+          fi
+          git add -A .
+
+          if git diff --cached --quiet; then
+            echo "no data changes"
+            exit 0
+          fi
+
+          git commit -m "report: summaries $(date -u +%Y-%m-%d)"
+
+          for i in 1 2 3 4 5; do
+            if git push; then
+              exit 0
+            fi
+
+            if ! git pull --rebase -X theirs origin "$BRANCH"; then
+              git rebase --abort 2>/dev/null || true
+              git reset --soft HEAD~1 2>/dev/null || true
+              git pull --rebase origin "$BRANCH"
+              git add -A .
+              git commit -m "report: summaries $(date -u +%Y-%m-%d)" || true
+            fi
+
+            sleep $((RANDOM % 8 + 2))
+          done
+
+          echo "push failed after retries" >&2
+          exit 1
+
+      - name: Generate issue comment
+        env:
+          PAGES_BASE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+        run: node src/issue-comment.js
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v6
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5 # 🟢 Upgraded v3 -> v5 to target the updated engine pipeline
+        with:
+          path: docs
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v5
+        with:
+          timeout_minutes: 10
+        continue-on-error: true
+
+      - name: Retry GitHub Pages deploy
+        if: steps.deploy.outcome == 'failure'
+        id: deploy_retry
+        uses: actions/deploy-pages@v5
+
+      - name: Resolve deployed page URL
+        id: page
+        if: always()
+        run: echo "page_url=${{ steps.deploy_retry.outputs.page_url || steps.deploy.outputs.page_url }}" >> "$GITHUB_OUTPUT"
+
+      - name: Post weekly summary to tracking issue
+        uses: actions/github-script@v9 # Already updated and fully functional with modern tokens
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('docs/comment.md', 'utf8');
+            const title = 'Weekly scan reports';
+
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              creator: 'app/github-actions',
+              per_page: 100,
+            });
+
+            let issue = issues.data.find(i => i.title === title);
+
+            if (!issue) {
+              const all = await github.rest.issues.listForRepo({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                per_page: 100,
+              });
+
+              issue = all.data.find(i => i.title === title);
+            }
+
+            if (!issue) {
+              const created = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body: 'Automated weekly accessibility and sustainability summaries are posted as comments here.',
+              });
+
+              issue = created.data;
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              body,
+            });

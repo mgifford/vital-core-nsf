@@ -1,0 +1,48 @@
+{
+  "name": "vital-scans",
+  "version": "0.1.0",
+  "description": "Open source website quality engine: accessibility (axe-core + Siteimprove Alfa) and sustainability scanning on GitHub Actions, reported via GitHub Pages.",
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "scripts": {
+    "prepare": "git config core.hooksPath .githooks || true",
+    "scan": "node src/scan.js",
+    "aggregate": "node src/aggregate.js",
+    "comment": "node src/issue-comment.js",
+    "prune": "node src/prune.js",
+    "check:spec-kitty": "node scripts/check-spec-kitty-governance.js",
+    "check:public-interest": "node scripts/check-public-interest.js",
+    "check:alfa-metadata": "node scripts/validate-alfa-metadata.js",
+    "check:ollama": "node scripts/check-ollama.js",
+    "i18n:extract": "node scripts/i18n-extract.js",
+    "i18n:check": "node scripts/i18n-extract.js --check",
+    "sync:hosting": "bash scripts/sync-hosting-branches.sh",
+    "test:unit": "node --test 'tests/unit/**/*.test.js'",
+    "test:e2e": "node tests/e2e.mjs",
+    "test": "npm run test:unit && npm run test:e2e"
+  },
+  "bin": {
+    "vital-mcp": "mcp/server.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "overrides": {
+    "@opentelemetry/core": ">=2.8.0",
+    "@hono/node-server": "^2.0.5",
+    "simple-git": "^4.0.2"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.31.0",
+    "@siteimprove/alfa-playwright": "^0.84.0",
+    "@siteimprove/alfa-test-utils": "^0.84.0",
+    "@tgwf/co2": "^0.18.0",
+    "axe-core": "^4.12.1",
+    "chrome-launcher": "^1.2.1",
+    "dictionary-en": "^4.0.0",
+    "lighthouse": "^13.5.0",
+    "nspell": "^2.1.5",
+    "playwright": "^1.56.0",
+    "yaml": "^2.9.0"
+  }
+}

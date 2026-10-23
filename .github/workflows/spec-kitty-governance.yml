@@ -1,0 +1,61 @@
+# Spec Kitty governance validation.
+name: spec-kitty-governance
+
+on:
+  push:
+    branches:
+      - main
+      - hf-spaces
+    paths:
+      - '.agents/**'
+      - '.github/workflows/spec-kitty-governance.yml'
+      - '.kittify/**'
+      - 'kitty-specs/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'scripts/check-spec-kitty-governance.js'
+  pull_request:
+    paths:
+      - '.agents/**'
+      - '.github/workflows/spec-kitty-governance.yml'
+      - '.kittify/**'
+      - 'kitty-specs/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'scripts/check-spec-kitty-governance.js'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 26
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --omit=optional --ignore-scripts
+
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+
+      - name: Parse workflow YAML
+        run: |
+          ruby -e "require 'yaml'; Dir['.github/workflows/*.yml'].sort.each { |f| YAML.safe_load_file(f, permitted_classes: []); puts \"parsed #{f}\" }"
+
+      - name: Check Spec Kitty governance
+        run: npm run check:spec-kitty
+
+      - name: Diff hygiene
+        run: git diff --check && git diff --cached --check
+
+      - name: Unit tests
+        run: npm run test:unit

@@ -1,0 +1,157 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { DIRS } from './config.js';
+import { writeLedgerIfChanged } from './fs-utils.js';
+
+/**
+ * Per-domain findings ledger: a committed record of every unique finding
+ * (by pattern_id) ever seen for a domain, with when it was first and last
+ * observed. This is what lets a report say "this issue has been present
+ * since week W12" or "last seen W20, now resolved".
+ *
+ * It's committed (data/<domain>/findings.json) so the history survives
+ * page-level pruning and accumulates across the whole life of the scan,
+ * not just the retention window.
+ *
+ * Shape:
+ * {
+ *   domain, updatedAt,
+ *   findings: {
+ *     "<pattern_id>": {
+ *       engine, ruleId, summary, wcag, severity,
+ *       firstSeen: "2026-W12", lastSeen: "2026-W24",
+ *       weeksSeen: 7,
+ *       lastPagesAffected: 12,
+ *       lastAffectedPages: ["https://example.gov/p1", ...],
+ *       _coverageLost: true  // optional; see updateFindings() doc below
+ *     }
+ *   }
+ * }
+ */
+
+function ledgerPath(domainKey) {
+  return path.join(DIRS.data, domainKey, 'findings.json');
+}
+
+export function loadFindings(domainKey, domain) {
+  const p = ledgerPath(domainKey);
+  if (fs.existsSync(p)) return JSON.parse(fs.readFileSync(p, 'utf8'));
+  return { domain, updatedAt: null, findings: {} };
+}
+
+export function saveFindings(domainKey, ledger) {
+  writeLedgerIfChanged(ledgerPath(domainKey), ledger);
+}
+
+/**
+ * Merge one week's bug reports into the ledger, updating first/last-seen.
+ * `week` is the ISO week the reports are for. Returns a map of
+ * pattern_id -> { firstSeen, lastSeen, weeksSeen } so callers (reports)
+ * can annotate each finding with its history.
+ *
+ * Idempotent for a given week: re-running aggregate for the same week
+ * does not double-count weeksSeen, because weeksSeen tracks distinct
+ * weeks via a recorded set.
+ *
+ * options.prevCoveredUrls — optional Set of page URLs checked by any engine
+ * during the previous week.  When provided, a brand-new finding whose every
+ * affected page is absent from that set is marked _coverageNew:true in the
+ * ledger.  deriveTrend() uses this flag to suppress a false "new" signal when
+ * coverage expanded and the finding only appeared on freshly-sampled pages.
+ * Omitting prevCoveredUrls reproduces the original behavior exactly — no
+ * migration of committed findings.json files is required.
+ *
+ * options.thisWeekCoveredUrls — the symmetric case (issue #222): an optional
+ * Set of page URLs checked by any engine during THIS week. When provided
+ * together with options.prevWeek, a finding whose lastSeen is exactly
+ * prevWeek (present last week, the immediately preceding one) and that is
+ * absent from `reports` this week is marked _coverageLost:true if none of
+ * its last-recorded affected pages (lastAffectedPages) appear in that set —
+ * i.e. its pages were never re-checked, so its disappearance cannot be
+ * credited as a confirmed fix. weekDeltas() (src/lib/progress.js) uses this
+ * flag to keep "fixed" honest. Omitting thisWeekCoveredUrls (or prevWeek)
+ * reproduces the original behavior exactly, same fallback contract as
+ * prevCoveredUrls.
+ */
+export function updateFindings(ledger, week, reports, { prevCoveredUrls, thisWeekCoveredUrls, prevWeek } = {}) {
+  for (const r of reports) {
+    const id = r.pattern_id;
+    const existing = ledger.findings[id];
+    if (!existing) {
+      // Coverage-expansion check: if we know which pages were sampled last week
+      // and NONE of this finding's affected pages appear in that set, the finding
+      // exists only because previously-unsampled pages were added to the scan.
+      const affectedUrls = r.affected_pages ?? [];
+      const isCoverageNew = prevCoveredUrls != null
+        && affectedUrls.length > 0
+        && !affectedUrls.some((url) => prevCoveredUrls.has(url));
+
+      ledger.findings[id] = {
+        engine: r.tool,
+        ruleId: r.rule_id,
+        summary: r.summary,
+        wcag: r.wcag_sc ?? null,
+        severity: r.severity,
+        firstSeen: week,
+        lastSeen: week,
+        _weeks: [week],
+        weeksSeen: 1,
+        lastPagesAffected: r.frequency.pages_affected,
+        lastAffectedPages: r.affected_pages ?? [],
+        ...(isCoverageNew ? { _coverageNew: true } : {}),
+      };
+    } else {
+      // Any reappearance supersedes a stale coverage-lost flag from a prior
+      // disappearance (see the coverage-lost pass below).
+      delete existing._coverageLost;
+      // Track distinct weeks (idempotent re-runs of the same week).
+      const weeks = new Set(existing._weeks ?? [existing.firstSeen]);
+      weeks.add(week);
+      existing._weeks = [...weeks].sort();
+      existing.weeksSeen = existing._weeks.length;
+      existing.firstSeen = existing._weeks[0];
+      // Once seen in a second week, the finding is confirmed real; clear the flag.
+      if (existing._coverageNew && existing._weeks.length > 1) delete existing._coverageNew;
+      // lastSeen is the latest week we've ever recorded this finding in.
+      if (compareWeek(week, existing.lastSeen) >= 0) {
+        existing.lastSeen = week;
+        existing.lastPagesAffected = r.frequency.pages_affected;
+        existing.lastAffectedPages = r.affected_pages ?? [];
+        existing.severity = r.severity;
+        existing.summary = r.summary;
+      }
+    }
+  }
+
+  // Coverage-lost detection (issue #222): a finding present last week but
+  // absent from `reports` this week is only a *confirmed* fix if we know its
+  // old pages were actually re-checked. Walk findings not touched by the loop
+  // above (i.e. not in `reports` this week) and flag the ones whose prior
+  // pages were never re-covered, so they aren't silently credited as fixed.
+  // Mirrors weekDeltas()'s own "present last week" definition (lastSeen ===
+  // prevWeek) for consistency with how the fixed/coverage-lost split reads it.
+  if (thisWeekCoveredUrls != null && prevWeek != null) {
+    const reportedIds = new Set(reports.map((r) => r.pattern_id));
+    for (const [id, existing] of Object.entries(ledger.findings)) {
+      if (reportedIds.has(id)) continue; // handled by the loop above (still present)
+      if (existing.lastSeen !== prevWeek) continue; // not a "disappeared this week" case
+      const priorPages = existing.lastAffectedPages ?? [];
+      if (priorPages.length === 0) continue; // no data to positively confirm against
+      const reCovered = priorPages.some((url) => thisWeekCoveredUrls.has(url));
+      if (!reCovered) existing._coverageLost = true;
+    }
+  }
+
+  // Return a lookup for annotating this week's reports.
+  const lookup = {};
+  for (const r of reports) {
+    const f = ledger.findings[r.pattern_id];
+    lookup[r.pattern_id] = { firstSeen: f.firstSeen, lastSeen: f.lastSeen, weeksSeen: f.weeksSeen };
+  }
+  return lookup;
+}
+
+/** Compare two ISO week strings ("2026-W24"). */
+function compareWeek(a, b) {
+  return a < b ? -1 : a > b ? 1 : 0;
+}

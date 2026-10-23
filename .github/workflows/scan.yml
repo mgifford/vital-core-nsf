@@ -1,0 +1,400 @@
+# Nightly incremental scans. Each run scans up to pages_per_run pages
+# per domain; coverage accumulates across the week into one ISO-week
+# dataset per domain.
+#
+# Current rescan behaviour:
+# - Successfully scanned URLs are scanned at most once per ISO week.
+# - Previously scanned URLs become eligible again when the ISO week changes.
+# - Priority URLs are selected before ordinary URLs but remain subject to
+#   the same once-per-ISO-week rule.
+# - Failed scans may be retried during the week, up to the failure threshold.
+#
+# Off-hours: crons are UTC. These schedules target late evening through
+# early morning US Eastern. During daylight saving time they run roughly
+# 23:11-05:47 ET on weeknights and 21:13-07:37 ET on weekends.
+# During standard time, they run one hour earlier.
+#
+# Scan data lives in the data repo (`data_repo` in config/targets.yml,
+# default mgifford/vital-core-data), checked out into data/ and pushed with
+# the VITAL_DATA_DEPLOY_KEY deploy key. This repo holds code only.
+#
+# Commit safety: each matrix job writes only data/<domain>/, so parallel
+# jobs never touch the same files. The push step rebases and retries to
+# absorb the race on the data repo's branch tip.
+#
+# Crawl state (state/<domain>/crawl.json) is NOT committed: it lives as
+# <domain>.crawl.json.gz on the rolling `scan-state` release
+# (scripts/state-release.js). Each job restores and re-uploads only its
+# own asset. A missing asset means the domain reseeds from its sitemap.
+
+name: scan
+
+on:
+  schedule:
+    # GitHub cron is UTC.
+    # ET during daylight saving time: UTC-4.
+    # ET during standard time: UTC-5.
+    # These avoid :00 because GitHub delays top-of-hour schedules.
+
+    # Weeknights: roughly 23:11-05:47 ET during EDT.
+    - cron: '11 3 * * 1-5'
+    - cron: '29 4 * * 1-5'
+    - cron: '43 5 * * 1-5'
+    - cron: '07 7 * * 1-5'
+    - cron: '31 8 * * 1-5'
+    - cron: '47 9 * * 1-5'
+
+    # Weekend: roughly 21:13-07:37 ET during EDT.
+    - cron: '13 1 * * 0,6'
+    - cron: '27 2 * * 0,6'
+    - cron: '41 3 * * 0,6'
+    - cron: '09 5 * * 0,6'
+    - cron: '23 6 * * 0,6'
+    - cron: '37 7 * * 0,6'
+    - cron: '51 8 * * 0,6'
+    - cron: '19 10 * * 0,6'
+    - cron: '37 11 * * 0,6'
+
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'Scan a single domain (blank = all)'
+        required: false
+      budget:
+        description: 'Override pages_per_run'
+        required: false
+      run_report:
+        description: 'Run report after this manual scan'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+  # Required for the optional-report job, which calls report.yml through
+  # workflow_call. GitHub grants the intersection of caller and callee
+  # permissions, so these must be declared here even though the scan jobs
+  # do not deploy directly to GitHub Pages.
+  pages: write
+  id-token: write
+
+concurrency:
+  group: scan-global
+  cancel-in-progress: false
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+
+    outputs:
+      domains: ${{ steps.list.outputs.domains }}
+      has_domains: ${{ steps.validate.outputs.has_domains }}
+
+    steps:
+      # Sparse and partial checkout keeps the matrix-discovery workspace small.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: |
+            src
+            scripts
+            config
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 26
+
+      - name: Select eligible domains
+        id: list
+        env:
+          DISPATCH_DOMAIN: ${{ github.event.inputs.domain }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          npm ci --omit=optional --ignore-scripts
+
+          if [ -n "$DISPATCH_DOMAIN" ]; then
+            if ! printf '%s' "$DISPATCH_DOMAIN" |
+              grep -qE '^[a-z0-9][a-z0-9._-]*\.[a-z]{2,}$'; then
+              echo "::error::domain must be a valid hostname (e.g. www.cms.gov)"
+              exit 1
+            fi
+
+            node -e "
+              import('./src/lib/config.js')
+                .then(({ loadConfig }) => {
+                  const domain = process.env.DISPATCH_DOMAIN;
+                  const known = loadConfig()
+                    .targets
+                    .filter((target) => !target.hf_only)
+                    .map((target) => target.domain);
+
+                  if (!known.includes(domain)) {
+                    console.error(
+                      'Unknown or restricted domain: ' + domain
+                    );
+                    process.exit(1);
+                  }
+
+                  console.log(
+                    'domains=' + JSON.stringify([domain])
+                  );
+                })
+                .catch((error) => {
+                  console.error(String(error));
+                  process.exit(1);
+                });
+            " >> "$GITHUB_OUTPUT"
+          else
+            # list-scan-domains.js reads every domain's state to skip
+            # domains with no budget left.
+            node scripts/state-release.js download-all
+            node scripts/list-scan-domains.js
+          fi
+
+      - name: Validate matrix output
+        id: validate
+        env:
+          DOMAINS: ${{ steps.list.outputs.domains }}
+        run: |
+          if [ -z "$DOMAINS" ]; then
+            echo "::error::The domain-selection step did not produce a domains output."
+            exit 1
+          fi
+
+          if ! printf '%s' "$DOMAINS" |
+            node -e "
+              let input = '';
+
+              process.stdin.on('data', (chunk) => {
+                input += chunk;
+              });
+
+              process.stdin.on('end', () => {
+                try {
+                  const value = JSON.parse(input);
+
+                  if (!Array.isArray(value)) {
+                    throw new Error('domains must be a JSON array');
+                  }
+
+                  if (!value.every((domain) => typeof domain === 'string')) {
+                    throw new Error(
+                      'every domains entry must be a string'
+                    );
+                  }
+                } catch (error) {
+                  console.error(String(error));
+                  process.exit(1);
+                }
+              });
+            "; then
+            echo "::error::Invalid domains output: $DOMAINS"
+            exit 1
+          fi
+
+          echo "Selected domains: $DOMAINS"
+
+          if [ "$DOMAINS" = "[]" ]; then
+            echo "has_domains=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No domains currently have eligible scan work."
+            echo "::notice::The scan job will be skipped."
+          else
+            echo "has_domains=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  scan:
+    needs: matrix
+
+    # GitHub rejects an empty matrix. Skip this job before matrix expansion
+    # when the discovery job reports that no domains are currently eligible.
+    if: ${{ needs.matrix.outputs.has_domains == 'true' }}
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        domain: ${{ fromJson(needs.matrix.outputs.domains) }}
+
+    concurrency:
+      group: scan-${{ matrix.domain }}
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: |
+            src
+            config
+            scripts
+            vendor
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 26
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Resolve data repo
+        id: datarepo
+        run: echo "repo=$(node scripts/data-repo.js)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ steps.datarepo.outputs.repo }}
+          ssh-key: ${{ secrets.VITAL_DATA_DEPLOY_KEY }}
+          path: data
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: |
+            ${{ matrix.domain }}
+
+      - name: Cache Playwright browser
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Check Wappalyzer vendor age
+        run: |
+          DATE=$(grep '^date:' vendor/wappalyzer/VERSION | awk '{print $2}')
+
+          if [ -z "$DATE" ]; then
+            echo "::warning::vendor/wappalyzer/VERSION has no date field - cannot check age"
+            exit 0
+          fi
+
+          VENDOR_EPOCH=$(
+            date -d "$DATE" +%s 2>/dev/null ||
+              date -j -f "%Y-%m-%d" "$DATE" +%s
+          )
+          NOW_EPOCH=$(date +%s)
+          AGE_DAYS=$(( (NOW_EPOCH - VENDOR_EPOCH) / 86400 ))
+
+          echo "Wappalyzer vendor age: ${AGE_DAYS} days (vendored ${DATE})"
+
+          if [ "$AGE_DAYS" -gt 90 ]; then
+            echo "::warning file=vendor/wappalyzer/VERSION::Wappalyzer fingerprints are ${AGE_DAYS} days old (vendored ${DATE}). Run scripts/update-wappalyzer.sh to refresh."
+          fi
+
+      # Fails on any error other than "no asset yet", so a transient API
+      # error can never lead to a fresh seed overwriting good state.
+      - name: Restore crawl state
+        id: restore
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: node scripts/state-release.js download "${{ matrix.domain }}"
+
+      - name: Scan
+        env:
+          NODE_OPTIONS: --max-old-space-size=5120
+          VITAL_SCAN_TIME_BUDGET_MINUTES: 95
+          DISPATCH_BUDGET: ${{ github.event.inputs.budget }}
+        run: |
+          BUDGET_FLAG=""
+
+          if [ -n "$DISPATCH_BUDGET" ]; then
+            if ! printf '%s' "$DISPATCH_BUDGET" |
+              grep -qE '^[0-9]+$'; then
+              echo "::error::budget must be a positive integer"
+              exit 1
+            fi
+
+            BUDGET_FLAG="--budget $DISPATCH_BUDGET"
+          fi
+
+          node src/scan.js \
+            --domain "${{ matrix.domain }}" \
+            $BUDGET_FLAG
+
+      - name: Save crawl state
+        if: always() && steps.restore.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: node scripts/state-release.js upload "${{ matrix.domain }}"
+
+      - name: Commit data
+        if: always() && steps.datarepo.outcome == 'success'
+        working-directory: data
+        run: |
+          git config user.name "vital-scans[bot]"
+          git config user.email "vital-scans@users.noreply.github.com"
+          BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+          git add "${{ matrix.domain }}"
+
+          if git diff --cached --quiet; then
+            echo "no changes"
+            exit 0
+          fi
+
+          git commit \
+            -m "scan(${{ matrix.domain }}): $(date -u +%Y-%m-%dT%H:%MZ)"
+
+          for i in 1 2 3 4 5; do
+            if git push; then
+              exit 0
+            fi
+
+            if ! git pull \
+              --rebase \
+              -X theirs \
+              origin \
+              "$BRANCH"; then
+
+              git rebase --abort 2>/dev/null || true
+              git reset --soft HEAD~1 2>/dev/null || true
+              git pull --rebase origin "$BRANCH"
+
+              git add "${{ matrix.domain }}"
+
+              git commit \
+                -m "scan(${{ matrix.domain }}): $(date -u +%Y-%m-%dT%H:%MZ)" ||
+                true
+            fi
+
+            sleep $((RANDOM % 10 + 2))
+          done
+
+          echo "push failed after retries" >&2
+          exit 1
+
+  optional-report:
+    needs:
+      - matrix
+      - scan
+
+    # A requested report may run when scan was skipped because no domains
+    # were eligible. It must not run when matrix discovery or a real scan
+    # failed.
+    if: >-
+      ${{
+        always() &&
+        github.event_name == 'workflow_dispatch' &&
+        inputs.run_report &&
+        needs.matrix.result == 'success' &&
+        (
+          needs.scan.result == 'success' ||
+          needs.scan.result == 'skipped'
+        )
+      }}
+
+    uses: ./.github/workflows/report.yml
+    # report.yml pushes to the data repo with VITAL_DATA_DEPLOY_KEY, and a
+    # called workflow only sees secrets passed to it.
+    secrets: inherit

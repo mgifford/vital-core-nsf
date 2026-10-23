@@ -1,0 +1,344 @@
+# vital-scans targets
+#
+# Each target is crawled and scanned incrementally across the week by the
+# nightly scan workflow. Budgets keep individual GitHub Actions jobs short
+# and keep load on target servers polite.
+#
+# Weekly coverage = pages_per_run x scheduled runs per week (see scan.yml).
+# Budget is sized so each domain job finishes well under 2 hours (shorter,
+# more robust runs): ~100 pages x ~11s/page ~= 18 min typical, with margin
+# for slow pages under the 110-min job cap. The 5 weekly crons accumulate
+# coverage: 100 x 5 ~= 500 pages/week/domain (more for higher importance).
+
+defaults:
+  pages_per_run: 150        # max pages scanned per domain per workflow run (keeps runs < 2h)
+  max_pages_per_week: 10000  # hard weekly cap per domain
+  delay_ms: 1500            # pause between page loads (politeness)
+  nav_timeout_ms: 30000     # page navigation timeout
+  networkidle_cap_ms: 8000  # max wait for network-idle after load; passive listening (sends nothing), so capping never adds server load
+  settle_delay_ms: 1000     # wait after load + network-idle before auditing (avoids pre-hydration false positives)
+  max_crawl_depth: 10        # BFS depth from seeds
+  retention_weeks: 2        # page-level detail kept this long; weekly summaries kept forever
+  user_agent: "vital-scans/0.1 (+https://github.com/mgifford/vital-core; accessibility and sustainability monitoring)"
+  reporting:
+    max_html_issues: 50
+    moderate_issue_threshold_percent: 5
+    include_key_page_issues: true
+    # Heuristic threshold: findings on this many or more pages are flagged
+    # "Likely template" (shared component). Findings on 1–2 pages are flagged
+    # "Likely content". Between the two = "unknown".
+    template_page_threshold: 10
+  display:
+    # How the accessibility score appears in per-domain reports and the archive.
+    # letter  — letter grade only (A/B/C/D/F)
+    # percent — numeric score only (e.g. "78")
+    # both    — letter grade and numeric score (default)
+    # none    — suppress the score section entirely
+    score_format: both
+  finding_policy:
+    conformance:
+      standard: WCAG
+      version: "2.2"
+      level: AA
+    defaults:
+      wcag_a_aa:
+        obligation: required
+        handling: report
+      wcag_aaa:
+        obligation: aspirational
+        handling: report
+      best_practice:
+        obligation: advisory
+        handling: report
+      not_required_for_conformance:
+        obligation: advisory
+        handling: report
+      unmapped:
+        obligation: unmapped
+        handling: review
+    rules: []
+
+# Which sustainability figure the reports headline: "co2" (grams CO2 per
+# page) or "energy" (watt-hours per page). Both are always recorded in the
+# data — this only changes what's shown, so switching needs no re-scan.
+# The SWD model computes CO2 = energy x grid carbon intensity, so energy
+# is the underlying physical quantity.
+sustainability_metric: energy
+
+# Base URL for published reports (used to generate absolute links in CSV exports
+# so that affected_pages_csv cells are clickable in Google Sheets / Excel).
+# Trailing slash is optional. Leave empty to keep CSV links relative.
+report_base_url: "https://mgifford.github.io/vital-core"
+
+# Scan data (data/) lives in its own repository, checked out into data/ by
+# scan.yml and report.yml, so cloning this repo gets code only. A target may
+# override it, but CI currently needs every non-hf_only target on one repo.
+# hf_only (VA) targets may not set it: their data never goes to git.
+data_repo: mgifford/vital-core-data
+
+# Report languages. Each report is rendered once per listed language; the
+# `default_language` keeps the canonical (unsuffixed) file paths — e.g.
+# accessibility.html — and every other language gets a locale suffix —
+# accessibility-fr.html. Readers reach a language via the URL: ?lang=ja loads
+# the Japanese sibling and remembers the choice (localStorage); a stored choice
+# only redirects from the default-language pages, so a shared English URL stays
+# English. Only UI chrome is translated (nav, labels, buttons, headings);
+# engine-sourced text such as WCAG/axe rule descriptions stays English.
+# Supported: en, fr, ja, nl. Translations are human-reviewed catalogs in
+# src/locales/<lang>.json; any missing string falls back to English, so partial
+# catalogs are safe. A target may override either key (e.g. Canada: [en, fr]).
+languages: [en, fr, ja, nl]
+default_language: en
+
+# Show the visible header language switcher. The ?lang= / localStorage runtime
+# selection above works regardless of this flag, so `false` makes every language
+# reachable by URL while leaving the default English pages visually unchanged
+# (no switcher chip). Flip to `true` to surface the switcher for discoverability.
+# Overridable per target.
+language_switcher: false
+
+# WebMCP bridge (issue #214 step 10, opt-in — no global default). Set
+# `webmcp: true` on an individual target below to emit a small, first-party
+# client-side script that registers read-only findings tools (mirroring the
+# local MCP server's vital_get_project_context / vital_list_findings /
+# vital_get_finding_context) with an in-browser MCP-capable agent, sourced
+# from this domain's own published /api/v1/ data. Unset or `false` means
+# the target ships zero additional bytes — this is not a per-target
+# override of a global default the way language_switcher is; there is no
+# top-level `webmcp:` key. See MCP.md.
+#
+# Example (commented out — enable deliberately per target, not by default):
+#   - domain: www.example.gov
+#     webmcp: true
+
+# Per-engine weekly coverage rates. Each value is the share of the week's
+# unique pages an engine runs on, as a fraction (0.3) or percent (30).
+# 0 (or omitted) disables an engine. Selection is deterministic per page
+# (a stable hash of page + engine + week), so coverage is reproducible
+# and a given page tends to stay in or out of an engine's sample for the
+# week. A target may override individual rates with its own `sampling:`.
+#
+# To add a future scanner, drop an engine module in src/engines/, wire it
+# in scan.js, and add a rate line here — that's the single control point.
+sampling:
+  axe: 100             # WCAG / Section 508 (axe-core)
+  alfa: 50             # independent ACT-rules audit (Siteimprove Alfa)
+  plain-language: 50   # readability of main content
+  link-check: 100       # broken-link probing of links seen on sampled pages
+  lighthouse: 10       # performance / a11y / best-practices / SEO (own Chrome; slow)
+  deprecated-html: 10 # obsolete/legacy HTML (<font>, <center>, etc.)
+  resources: 100       # catalog PDFs, Office docs, iframes, embedded media
+  images: 100           # inline <img> inventory: alt text, dimensions, file size
+  standards: 50        # web standards / metadata / social (ScanGov-style, per page)
+  security: 10         # HTTPS, security headers, security.txt, .gov TLD (per origin)
+  public-interest: 10  # accessibility statement, carbon.txt, Green Web Foundation, sitemaps (per origin)
+  offline-resilience: 0 # offline fallback + Cache Storage usage (per origin; own browser context, opt-in cost — enable per target)
+  sustainability: 10   # page weight + estimated CO2
+  tech: 10             # technology detection (CMS, frameworks, CDNs, analytics) — small sample sufficient
+  third-party: 25      # third-party JS/resource cost per page (load bytes/time + which origins serve scripts); varies per page, so sampled like sustainability
+
+# DRAFT, NOT YET IMPLEMENTED:
+#
+# domain_scan_cadence:
+#   Controls how often this domain may start a scan.
+#   Supported future values:
+#     incremental  - current behaviour; may run several times during the week
+#                    until the weekly cap or frontier is exhausted
+#     daily        - run no more than once per UTC calendar day
+#
+# url_rescan_interval_days:
+#   Number of days before an ordinary previously scanned URL becomes
+#   eligible for another scan.
+#
+# priority_url_rescan_interval_days:
+#   Number of days before a configured priority URL becomes eligible again.
+#
+#   priority_urls_file: path to a file of top-task URLs, one per line.
+#     Blank lines and # comments are ignored. These URLs are covered before
+#     ordinary URLs. Under the current implementation, no URL is scanned
+#     more than once per ISO week.
+#
+#   domain_scan_cadence: DRAFT, NOT YET IMPLEMENTED.
+#     Intended values:
+#       incremental - allow multiple incremental runs during the week
+#       daily       - allow no more than one domain scan per UTC day
+#
+#   url_rescan_interval_days: DRAFT, NOT YET IMPLEMENTED.
+#     Intended number of elapsed days before an ordinary URL is eligible
+#     for rescanning. Current behaviour uses the ISO-week boundary.
+#
+#   priority_url_rescan_interval_days: DRAFT, NOT YET IMPLEMENTED.
+#     Intended number of elapsed days before a priority URL is eligible
+#     for rescanning. Use 7 for weekly priority URL coverage.
+
+
+targets:
+  # Discovery is host-scoped. The apex domain and its `www.` variant are
+  # treated as the same site (so cdc.gov and www.cdc.gov are crawled
+  # together), but any other subdomain is a distinct target
+  # (data.cms.gov is separate from www.cms.gov).
+  #
+  # Per-target options (all optional):
+  #   importance: 1-5 (default 3). Scales max_pages_per_week: 3 = the
+  #     configured cap, 1 = a third (good for near-identical open-data
+  #     sites), 5 = 5/3. Tune low-value domains down, key domains up.
+  #   priority_urls_file: path to a file of top-task URLs (one per line,
+  #     # comments ok — top-task-finder output). These are covered first
+  #     every week, before the rest of the site is sampled. No URL is ever
+  #     scanned more than once per ISO week.
+  #   priority_urls: [ ... ] inline list, for a handful of must-cover URLs.
+  #
+  #   languages: [ ... ] / default_language: override the global report
+  #     languages for this one target. The default_language keeps the canonical
+  #     (unsuffixed) report paths; each other language is published alongside as
+  #     <page>-<lang>.html with a header language switcher. Examples:
+  #       languages: [en, fr]            # Canada — English + French
+  #       languages: [en, ja]            # Japan — English + Japanese
+  #       languages: [en, nl]            # Netherlands — English + Dutch
+  #       default_language: fr           # make French the canonical default
+  #
+  #   url_include: [ ... ] optional list of patterns. When set, ONLY URLs whose
+  #     full normalized URL matches at least one pattern are crawled and scanned.
+  #     Useful for focusing a scan on a subtree or topic area. Each pattern is a
+  #     substring, or a /regex/ when wrapped in slashes (optional trailing flags).
+  #     Examples:
+  #       url_include: ["/children/"]           # only paths containing /children/
+  #       url_include: ["medicare", "medicaid"] # either word in the URL
+  #       url_include: ["/\\d{4}/report/"]      # regex: a 4-digit year segment
+  #     Priority URLs always bypass this filter.
+  #
+  #   url_exclude: [ ... ] optional list of patterns. URLs whose full normalized
+  #     URL matches any of these are silently skipped during crawl and scan.
+  #     Applied after url_include. Same substring-or-/regex/ matching as
+  #     url_include. Useful for pruning noise or known-inaccessible paths that
+  #     would skew results.
+  #     Examples:
+  #       url_exclude: ["press_release", "/news/", "?page="]
+  #       url_exclude: ["/es/", "/zh/"]         # skip non-English language sections
+  #       url_exclude: ["/\\d{4}/\\d{2}/"]      # regex: dated archive paths
+  #     Priority URLs always bypass this filter.
+  #
+  #   url_include_file: / url_exclude_file: optional path to a file of the same
+  #     patterns, one per line (# comments and blank lines ignored). Merged with
+  #     the inline list above. Relative paths resolve under config/ (like
+  #     priority_urls_file), so keep long exclusion lists in their own file.
+  #     Examples:
+  #       url_exclude_file: exclusions/www.cms.gov-exclude.txt
+  #
+  #   spelling_allowlist: [ ... ] optional list of domain-specific terms that
+  #     the spell checker should accept without flagging. Layered on top of
+  #     config/spelling-allowlist.txt (project-wide). Useful for government
+  #     program names, medical terms, and agency acronyms that aren't in a
+  #     general English dictionary.
+  #     Examples:
+  #       spelling_allowlist: ["Medicaid", "FMAP", "CHIPRA", "MACRA"]
+  #       spelling_allowlist: ["Sequestration", "Beneficiaries", "CMS"]
+  #
+  #   url_exclude_patterns: [ ... ] optional list of substring or /regex/ patterns
+  #     to exclude from REPORT output only (not from the scan), for EVERYONE, at
+  #     build time. Useful when some teams own certain URL patterns and aren't
+  #     responsible for fixing them. Affects bug counts, affected-page lists, and
+  #     prioritization on the accessibility page. Scanning still includes
+  #     everything — this only filters the report display.
+  #     Examples:
+  #       url_exclude_patterns: [".aspx"]          # hide legacy ASP.NET pages
+  #       url_exclude_patterns: ["/api/", "/admin/"]  # hide API and admin endpoints
+  #     Note: report readers can ALSO set their own per-viewer exclusion list in
+  #     the browser (the "Exclude URLs from this report" box on the landing and
+  #     Accessibility pages; stored in localStorage, issue #209). That is additive
+  #     to this baseline and needs no config change or re-scan.
+  #
+  #   design_system: optional component taxonomy for clustering and attribution.
+  #     Supported values: cms-ds, uswds, none.
+  #   design_system_theme: optional free-form theme string used in report copy.
+  #
+  #   webmcp: optional boolean, default false. Opt-in only — omit or set to
+  #     false to leave a target unaffected. Example: webmcp: true
+  #
+  # WAF-blocked: hhs.gov and nih.gov return 403 "Access Denied" to
+  # automated browsers and record as blocked with no audit data until the
+  # scanner's user-agent is allowlisted. Kept in to track once access is
+  # sorted — see WAF-ALLOWLIST.md for the request template and status.
+  - domain: www.cms.gov
+    importance: 5
+    pages_per_run: 90   # memory guard: lower per-run concurrency/load for this large domain
+    priority_urls_file: profiles/www.cms.gov-top-tasks.txt
+
+    # DRAFT, NOT YET IMPLEMENTED.
+    # Previously scanned ordinary URLs become eligible after seven days.
+    url_rescan_interval_days: 7
+    # DRAFT, NOT YET IMPLEMENTED.
+    # Priority URLs remain weekly, as requested.
+    priority_url_rescan_interval_days: 7
+    
+    url_exclude_patterns: [".aspx"]
+    design_system: cms-ds
+    design_system_theme: default
+    webmcp: true
+    sampling:
+      alfa: 15       # stronger memory guard: reduce heavy DOM snapshot workload
+      resources: 75  # reduce large-resource cataloging pressure on peak heap
+      images: 75     # reduce image inventory payload on this high-volume target
+  - domain: www.medicare.gov
+    importance: 5
+
+    # DRAFT, NOT YET IMPLEMENTED.
+    domain_scan_cadence: incremental
+    url_rescan_interval_days: 7
+    priority_url_rescan_interval_days: 7
+    
+    design_system: cms-ds
+    design_system_theme: medicare
+    webmcp: true
+    sampling:
+      alfa: 25   # same memory guard as www.cms.gov (importance 5, 150 pages/run)
+  - domain: www.medicaid.gov
+    importance: 5
+    finding_policy:
+      rules:
+        - match:
+            engine: alfa
+            rule_id: sia-r113
+          obligation: required
+          handling: review
+          reason: >-
+            WCAG 2.5.8 target-size results can require manual verification of
+            spacing, equivalent controls, and essential-size exceptions.
+          evidence:
+            - https://alfa.siteimprove.com/rules/sia-r113
+  - domain: data.healthcare.gov
+    importance: 3                  # open-data site; pages are template-similar
+  - domain: openpaymentsdata.cms.gov
+    importance: 3                  # open-data site; lighthouse disabled (perf:6-55 → audits take 2-5 min each)
+    webmcp: true
+    sampling:
+      lighthouse: 0
+  - domain: www.cdc.gov
+    importance: 1
+    sampling:
+      alfa: 25   # memory guard: keeps Alfa's in-memory DOM snapshots below the runner heap limit
+  - domain: data.cms.gov
+    importance: 3                  # open-data site
+  - domain: data.medicaid.gov
+    importance: 3                  # open-data site
+  - domain: www.healthcare.gov
+    importance: 3
+  - domain: nih.gov            # WAF-blocked (see WAF-ALLOWLIST.md)
+    importance: 1
+  - domain: hhs.gov            # WAF-blocked (see WAF-ALLOWLIST.md)
+    importance: 1
+
+  # Department of Veterans Affairs — scanned ONLY via the "va" profile on
+  # Hugging Face. hf_only: true prevents these from running in GitHub Actions.
+  - domain: www.va.gov
+    importance: 5
+    hf_only: true
+  - domain: volunteer.va.gov
+    importance: 3
+    hf_only: true
+  - domain: news.va.gov
+    importance: 3
+    hf_only: true
+  - domain: benefits.va.gov
+    importance: 3
+    hf_only: true
