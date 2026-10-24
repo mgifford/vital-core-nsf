@@ -15,9 +15,10 @@ for nsf") and `mgifford/vital-core` at `f5bac30`.
   matrix, `scripts/data-repo.js` and the report build all fail on their first
   step. Nothing could run until this was fixed. Fixed in
   [PR #1](https://github.com/mgifford/vital-core-nsf/pull/1).
-- **Go-live gotcha: scheduled scans never start a new domain.** A domain with
-  no saved crawl state is skipped by the scheduled matrix as "frontier empty".
-  Each domain needs one manual single-domain run first (see step 11).
+- **Go-live gotcha: scheduled scans never started a new domain.** A domain with
+  no saved crawl state was skipped by the scheduled matrix as "frontier empty".
+  Fixed in [PR #2](https://github.com/mgifford/vital-core-nsf/pull/2) (see
+  step 11).
 - **The history is not shared with upstream.** This repo has two commits.
   "Initial commit" (`e5b744c`) is a full copy of upstream's files, as a new root
   commit. "updating for nsf" (`c3d3486`) changes only `config/targets.yml`.
@@ -122,27 +123,44 @@ pass locally.
 
    The data repo already exists, is public, and has an initial commit on
    `main`. That's enough for the checkout step.
+
+   **If the secret is missing or the key is read-only, nothing fails until the
+   push.** `actions/checkout` falls back to the workflow token when `ssh-key` is
+   empty. That token can read the public data repo but can't push to it. So
+   checkout and aggregate succeed, then "Commit data" (scan) or "Commit
+   summaries and pruning" (report) fails after 5 push attempts. Pages never
+   deploys, because it comes after that step. This happened in
+   [report run 40051043543](https://github.com/mgifford/vital-core-nsf/actions/runs/40051043543).
+   The failed step's log tells you which case you're in:
+   - `Permission to mgifford/vital-core-nsf-data.git denied to github-actions[bot]`:
+     the `VITAL_DATA_DEPLOY_KEY` secret is missing or misnamed in this repo.
+   - `The key you are authenticated with has been marked as read only`: the
+     deploy key on the data repo doesn't have **Allow write access** ticked.
+   - `Permission denied (publickey)`: the secret doesn't match the public key on
+     the data repo.
 10. **Keep the data repo public.** The report `gate` job reads
     `.repo-size-kb`, `.last-report-date` and the repo size through
     `gh api repos/<data_repo>` using the workflow's own `github.token`. That
     token can't read another private repo, so the size check would fail the
     job.
-11. **First run: seed each domain by hand, one at a time.** The scheduled
-    matrix (`scripts/list-scan-domains.js`) skips any domain whose crawl state
-    has no pages. It treats it as "frontier empty", but seeding from the sitemap
-    only happens inside `scan.js`. A new domain is never picked, and neither is
-    one whose `scan-state` release asset is lost. Running "Run workflow" with the
-    domain left blank goes through the same filter, so it seeds nothing either.
-    For each of `www.nsf.gov`, `par.nsf.gov`, `ncses.nsf.gov`, `iucrc.nsf.gov`
-    and `seedfund.nsf.gov`:
-    - Actions → scan → Run workflow, with that domain and a small budget (for
-      example 10).
-    - Tick "Run report" on the last one only.
+11. **First run.** After step 9 is confirmed: Actions → scan → Run workflow,
+    with the domain left blank, a small budget (for example 10), and "Run report"
+    ticked. That scans all five domains in parallel, commits to the data repo,
+    and publishes to Pages.
 
-    Single-domain runs skip the filter and save crawl state to the
-    `scan-state` release. After that, the crons take over. Check the Pages URL
-    after the report runs. The proper fix belongs upstream: see
-    `UPSTREAM-SUGGESTIONS.md` §6.
+    Before [PR #2](https://github.com/mgifford/vital-core-nsf/pull/2), the
+    matrix filter (`budgetStatus()` in `src/lib/state.js`, used by
+    `scripts/list-scan-domains.js`) treated a domain whose crawl state had no
+    pages as "frontier empty". So a new domain, or one whose `scan-state` asset
+    was lost, was never picked, by the crons or by a blank "Run workflow". That's
+    why [scan run 40050709114](https://github.com/mgifford/vital-core-nsf/actions/runs/40050709114)
+    succeeded without scanning anything. PR #2 treats an empty state as needing
+    a seed, which matches the `Object.keys(state.pages).length === 0` check in
+    `scan.js`.
+
+    Don't start several scan runs back to back. `scan.yml` has a `scan-global`
+    concurrency group, and GitHub keeps only the newest waiting run, cancelling
+    the others.
 12. **Watch for scheduled workflows being turned off.** GitHub turns off
     scheduled workflows in a public repo after 60 days without repository
     activity. Scan data commits go to the data repo, not this one, so this repo
