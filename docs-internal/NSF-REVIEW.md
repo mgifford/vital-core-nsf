@@ -13,7 +13,11 @@ for nsf") and `mgifford/vital-core` at `f5bac30`.
   `targets:` keys, at lines 175 and 262. The `yaml` parser stops with
   `Map keys must be unique at line 262`, so `loadConfig()` throws. The scan
   matrix, `scripts/data-repo.js` and the report build all fail on their first
-  step. Nothing will run until this is fixed.
+  step. Nothing could run until this was fixed. Fixed in
+  [PR #1](https://github.com/mgifford/vital-core-nsf/pull/1).
+- **Go-live gotcha: scheduled scans never start a new domain.** A domain with
+  no saved crawl state is skipped by the scheduled matrix as "frontier empty".
+  Each domain needs one manual single-domain run first (see step 11).
 - **The history is not shared with upstream.** This repo has two commits.
   "Initial commit" (`e5b744c`) is a full copy of upstream's files, as a new root
   commit. "updating for nsf" (`c3d3486`) changes only `config/targets.yml`.
@@ -45,26 +49,28 @@ tests locally at `c3d3486` gives these 9 failures. Each throws
 
 After step 1, 7 of these pass. The other 2 (`config.test.js:48` and
 `url-exclusion.test.js:6`) still fail because they expect `www.cms.gov` (step 2).
-Every branch and pull request off this `main` inherits the failure, including
-the pull request that adds this file, until both steps land.
+[PR #1](https://github.com/mgifford/vital-core-nsf/pull/1) applies both fixes.
+With them, `npm run i18n:check`, all 533 unit tests and `npm run test:e2e`
+pass locally.
 
 ## Go-live checklist
 
 ### In this repo
 
-1. **Fix `config/targets.yml`.** Delete the second `targets:` line (262), so the
-   five NSF entries sit under the first `targets:` (175), after its comment
-   block. I tested this: the file parses and resolves to the five NSF hosts.
-2. **Fix two unit tests that hard-code CMS targets from the live config.**
-   Otherwise `tests.yml` fails on every push:
-   - `tests/unit/config.test.js:48`: expects `www.cms.gov` with
+1. **Fix `config/targets.yml`** (done in PR #1). Delete the second `targets:`
+   line (262), so the five NSF entries sit under the first `targets:` (175),
+   after its comment block. The file then parses and resolves to the five NSF
+   hosts and `mgifford/vital-core-nsf-data`.
+2. **Fix two unit tests that hard-code CMS targets from the live config**
+   (done in PR #1). Otherwise `tests.yml` fails on every push:
+   - `tests/unit/config.test.js:48`: expected `www.cms.gov` with
      `design_system: cms-ds`
-   - `tests/unit/url-exclusion.test.js:6`: expects `www.cms.gov` with
+   - `tests/unit/url-exclusion.test.js:6`: expected `www.cms.gov` with
      `url_exclude_patterns: [".aspx"]`
 
-   With step 1 applied, these were the only config-related failures. In my
-   sandbox, 13 Playwright-based tests also failed, but that was a local
-   browser-version mismatch. CI installs Chromium itself.
+   Both now use inline YAML with `example.gov`, like the tests around them.
+   The design-system test now passes `CMS-DS` in mixed case, so it really
+   checks normalization.
 3. **Join the history to upstream (one time).** The tree is identical to
    upstream `f5bac30` apart from `targets.yml`, so an `ours` merge records
    upstream as an ancestor without changing any file:
@@ -121,9 +127,22 @@ the pull request that adds this file, until both steps land.
     `gh api repos/<data_repo>` using the workflow's own `github.token`. That
     token can't read another private repo, so the size check would fail the
     job.
-11. **First run:** Actions → scan → Run workflow, with domain `www.nsf.gov`, a
-    small budget (for example 10), and "Run report" ticked. Check the Pages URL,
-    then let the crons take over.
+11. **First run: seed each domain by hand, one at a time.** The scheduled
+    matrix (`scripts/list-scan-domains.js`) skips any domain whose crawl state
+    has no pages. It treats it as "frontier empty", but seeding from the sitemap
+    only happens inside `scan.js`. A new domain is never picked, and neither is
+    one whose `scan-state` release asset is lost. Running "Run workflow" with the
+    domain left blank goes through the same filter, so it seeds nothing either.
+    For each of `www.nsf.gov`, `par.nsf.gov`, `ncses.nsf.gov`, `iucrc.nsf.gov`
+    and `seedfund.nsf.gov`:
+    - Actions → scan → Run workflow, with that domain and a small budget (for
+      example 10).
+    - Tick "Run report" on the last one only.
+
+    Single-domain runs skip the filter and save crawl state to the
+    `scan-state` release. After that, the crons take over. Check the Pages URL
+    after the report runs. The proper fix belongs upstream: see
+    `UPSTREAM-SUGGESTIONS.md` §6.
 12. **Watch for scheduled workflows being turned off.** GitHub turns off
     scheduled workflows in a public repo after 60 days without repository
     activity. Scan data commits go to the data repo, not this one, so this repo

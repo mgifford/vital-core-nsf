@@ -146,14 +146,39 @@ Better still, take the placeholder examples from the fleet's own first target.
 
 `tests/unit/config.test.js:48` and `tests/unit/url-exclusion.test.js:6` assert
 CMS-specific values from the real `config/targets.yml`. Any child fails CI as
-soon as it changes its fleet. Rewrite both to use inline YAML, as the
-neighbouring tests already do. More generally: tests may check that the live
-config loads and validates, but never what it contains. Also consider a
-`check:config` step that parses `targets.yml` and every profile, so a broken
-config fails with a clear message. The duplicate `targets:` key in
-`vital-core-nsf` broke 9 tests with an indirect error.
+soon as it changes its fleet. Both are rewritten with inline YAML in
+[vital-core-nsf#1](https://github.com/mgifford/vital-core-nsf/pull/1), and those
+two changes can be ported upstream as they are. More generally: tests may
+check that the live config loads and validates, but never what it contains.
+Also consider a `check:config` step that parses `targets.yml` and every
+profile, so a broken config fails with a clear message. The duplicate
+`targets:` key in `vital-core-nsf` broke 9 tests with an indirect error.
 
-## 6. Workflows a child can configure without editing them
+## 6. Bug: scheduled runs never seed a new domain
+
+`scripts/list-scan-domains.js` builds the scheduled matrix with
+`budgetStatus()` from `src/lib/state.js`. For a domain with no saved state,
+`loadState()` returns `pages: {}`, so `frontierEmpty` is `true` and the domain
+is skipped as "frontier empty (no scannable pages)". Seeding from the sitemap
+and homepage only happens inside `src/scan.js` (`seededAt`), so it never gets
+the chance.
+
+This affects:
+
+- every target added to an existing fleet
+- every target of a brand-new child repo
+- any domain whose `<domain>.crawl.json.gz` asset on the `scan-state` release is
+  lost. That contradicts the "missing asset means the domain reseeds from its
+  sitemap" note in `scan.yml` and `README.md`.
+
+A "Run workflow" with the domain left blank goes through the same filter. Only
+single-domain dispatches seed.
+
+Suggested fix: in `list-scan-domains.js`, treat unseeded state as runnable,
+for example `} else if (frontierEmpty && state.seededAt) {`. Add a unit test
+for an empty state.
+
+## 7. Workflows a child can configure without editing them
 
 - Let `report.yml` read the profile from a repo variable
   (`VITAL_PROFILE: ${{ vars.VITAL_PROFILE }}`). A child can then brand its
@@ -166,7 +191,7 @@ config fails with a clear message. The duplicate `targets:` key in
   then turns off scheduled workflows in public repos. Document this, or add a
   lightweight keepalive.
 
-## 7. A new-fleet setup script (optional)
+## 8. A new-fleet setup script (optional)
 
 A `scripts/new-fleet.sh` using `gh` could:
 
