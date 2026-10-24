@@ -183,7 +183,61 @@ adds an "unseeded" case to the `budgetStatus` unit test in
 domain never stays empty, and once its pages are scanned or failed out it is
 skipped as before.
 
-## 7. Workflows a child can configure without editing them
+## 7. Bug: a failed data push throws away the scan
+
+In `.github/workflows/scan.yml`, the scan job runs these steps in this order:
+
+1. "Restore crawl state"
+2. "Scan"
+3. "Save crawl state" (`if: always() && steps.restore.outcome == 'success'`)
+4. "Commit data"
+
+So crawl progress is uploaded to the `scan-state` release before the page
+records are committed. If the push to the data repo fails, those pages stay
+marked `lastScannedWeek: <this week>`, but their records are lost when the
+runner is discarded. They won't be scanned again until the next ISO week.
+
+**Seen in `vital-core-nsf` on 2026-10-24.** The deploy key couldn't push. Ten
+scan runs (one manual, nine scheduled) each failed at "Commit data". By then,
+about 970 NSF pages were marked done for 2026-W43, with no data kept. The
+scheduled runs kept crawling NSF and discarding the results.
+
+The problem gets in quietly. `actions/checkout` with an empty `ssh-key` falls
+back to the workflow token. That token can read a public data repo but can't
+push to it. So with the `VITAL_DATA_DEPLOY_KEY` secret missing, or the deploy
+key read-only, checkout, Chromium install and the whole scan succeed. Only the
+final push fails, after five retries.
+
+Suggested changes, in order of value:
+
+- **Commit before saving crawl state.** Give "Commit data" an `id: commit`,
+  move it above "Save crawl state", and gate the save on it:
+  `if: always() && steps.restore.outcome == 'success' && steps.commit.outcome == 'success'`.
+  Rescanning is safe. Page records are written to
+  `data/<domain>/<week>/pages/<pageId>.json` (`src/scan.js:421`), so scanning
+  the same page twice in a week overwrites one file. At worst it adds an extra
+  `runs/*.json` log.
+- **Fail fast on push access, before scanning.** Right after the data repo
+  checkout:
+  - fail with a clear `::error::` if the secret is empty (pass it through
+    `env:`, since `secrets` can't be read in `if:`)
+  - then run `git push --dry-run origin HEAD`
+
+  A read-only or missing key should then fail in seconds, without loading the
+  target site. Use the same check in `report.yml` before "Aggregate".
+- **Don't let a data-repo problem take the site down.** In `report.yml`,
+  "Configure Pages" and the deploy steps come after "Commit summaries and
+  pruning". So a push failure also stops the site from updating, even though
+  `docs/` was already built. Consider deploying when the commit fails, with a
+  `::warning::`. `aggregate.js` recomputes summaries from the page records on
+  the next run, so nothing is lost by deploying first.
+- **Make an empty matrix visible.** A manual "Run workflow" where every domain
+  is skipped (the §6 bug, or every domain at its cap) ends green with only
+  `::notice::` lines. For a `workflow_dispatch`, emit a `::warning::` and put the
+  reasons in the job summary, so a scan that scanned nothing doesn't look like
+  a successful scan.
+
+## 8. Workflows a child can configure without editing them
 
 - Let `report.yml` read the profile from a repo variable
   (`VITAL_PROFILE: ${{ vars.VITAL_PROFILE }}`). A child can then brand its
@@ -196,7 +250,7 @@ skipped as before.
   then turns off scheduled workflows in public repos. Document this, or add a
   lightweight keepalive.
 
-## 8. A new-fleet setup script (optional)
+## 9. A new-fleet setup script (optional)
 
 A `scripts/new-fleet.sh` using `gh` could:
 
