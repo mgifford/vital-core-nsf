@@ -174,9 +174,14 @@ This affects:
 A "Run workflow" with the domain left blank goes through the same filter. Only
 single-domain dispatches seed.
 
-Suggested fix: in `list-scan-domains.js`, treat unseeded state as runnable,
-for example `} else if (frontierEmpty && state.seededAt) {`. Add a unit test
-for an empty state.
+Fixed in [vital-core-nsf#2](https://github.com/mgifford/vital-core-nsf/pull/2),
+which can be ported upstream as it is. `budgetStatus()` now reports
+`frontierEmpty: false` when the state has no pages, matching the
+`Object.keys(state.pages).length === 0` seed check in `scan.js`. The PR also
+adds an "unseeded" case to the `budgetStatus` unit test in
+`tests/unit/lib.test.js`. A seed always adds at least the homepage, so a seeded
+domain never stays empty, and once its pages are scanned or failed out it is
+skipped as before.
 
 ## 7. Workflows a child can configure without editing them
 
