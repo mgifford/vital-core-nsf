@@ -14,9 +14,39 @@ for nsf") and `mgifford/vital-core` at `f5bac30`.
   `Map keys must be unique at line 262`, so `loadConfig()` throws. The scan
   matrix, `scripts/data-repo.js` and the report build all fail on their first
   step. Nothing will run until this is fixed.
-- **The history is not shared with upstream.** This repo has two commits, a
-  GitHub "Initial commit" and the copy. Upstream changes can't be merged
-  cleanly until the two histories are joined (see step 1).
+- **The history is not shared with upstream.** This repo has two commits.
+  "Initial commit" (`e5b744c`) is a full copy of upstream's files, as a new root
+  commit. "updating for nsf" (`c3d3486`) changes only `config/targets.yml`.
+  Upstream changes can't be merged cleanly until the two histories are joined
+  (see step 3).
+
+## CI status
+
+The `tests` workflow
+[run 40018952284](https://github.com/mgifford/vital-core-nsf/actions/runs/40018952284)
+on `main` (`c3d3486`) failed at its "Unit tests" step. The previous run, on
+"Initial commit" (`e5b744c`), passed. So the `targets.yml` change is the cause.
+
+The raw CI log couldn't be fetched from the review session. Running the unit
+tests locally at `c3d3486` gives these 9 failures. Each throws
+`Map keys must be unique at line 262, column 1` from `loadConfig()`:
+
+| Test | Location |
+|---|---|
+| config: loadConfig exposes languages on every target | `tests/unit/config.test.js:39` |
+| config: normalizes supported design_system values | `tests/unit/config.test.js:48` |
+| config: webmcpEnabled resolves to a strict boolean for every real target | `tests/unit/config.test.js:98` |
+| config: loadConfig surfaces reportBaseUrl with no trailing slash | `tests/unit/config.test.js:108` |
+| config: findingPolicy is available on every target | `tests/unit/config.test.js:114` |
+| config: the real targets.yml resolves to a single CI data repo | `tests/unit/config.test.js:187` |
+| state-release: every configured hf_only target is refused | `tests/unit/state-release.test.js:16` |
+| url_exclude_patterns: config loads with url_exclude_patterns field | `tests/unit/url-exclusion.test.js:6` |
+| url_exclude_patterns: default is empty array when not set | `tests/unit/url-exclusion.test.js:15` |
+
+After step 1, 7 of these pass. The other 2 (`config.test.js:48` and
+`url-exclusion.test.js:6`) still fail because they expect `www.cms.gov` (step 2).
+Every branch and pull request off this `main` inherits the failure, including
+the pull request that adds this file, until both steps land.
 
 ## Go-live checklist
 
