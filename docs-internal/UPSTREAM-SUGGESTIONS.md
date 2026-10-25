@@ -269,3 +269,137 @@ A `scripts/new-fleet.sh` using `gh` could:
 - print the "first run" steps
 
 This would turn the GitHub settings part of `NSF-REVIEW.md` into one command.
+
+## 10. Separate legal requirements from the build target, AAA and best practice
+
+Recorded 2026-10-25. Implemented in
+[vital-core-nsf#8](https://github.com/mgifford/vital-core-nsf/pull/8), and every
+part of it applies upstream unchanged.
+
+On the NSF reports, "Fix these first" ranked findings by pages × severity ×
+reach and nothing else. AAA criteria (1.4.6, 1.4.8, 2.5.5) and best practices
+filled all eight rows, while the three findings against required WCAG 2.0
+A/AA and 2.2 AA criteria didn't appear at all. Four separate problems
+combined:
+
+1. **The ranking ignored the finding policy.** `rankBugs()` in
+   `src/lib/priority.js` never read `obligation`, even though
+   `applyFindingPolicy()` had already classified every finding as required,
+   aspirational, advisory or unmapped. The "Biggest available win" callout and
+   the fleet's "Worst offenders" table used the same ranking.
+2. **45 Alfa rule names had drifted onto other rules.** In
+   `config/alfa-rule-labels.json`, most titles from about `sia-r40` onwards
+   described a different rule. For example:
+   - `sia-r57` (text in a landmark) was called "Scrolling content can be
+     accessed by keyboard", which is `sia-r84`
+   - `sia-r61` (page starts with an h1) was called "Form field label is
+     visible"
+   - `sia-r73` (paragraph line height) was called "Text has minimum contrast
+     ratio of 4.5:1"
+
+   `check:alfa-metadata` only checks that a label exists, so nothing caught it.
+3. **Alfa best-practice rules were "Undetermined".** Only axe's
+   `best-practice` tag was recognised. Twenty Alfa rules that declare only an
+   Alfa best practice or a WAI-ARIA authoring rule fell through to
+   `unmapped`, and their summaries read "(WCAG criterion undetermined)".
+4. **There was one conformance target, with no legal baseline.** The policy
+   couldn't express "WCAG 2.0 AA is the legal minimum (Section 508), and WCAG
+   2.2 AA is what we build to". It also put an A/AA criterion newer than the
+   target (for example 2.5.8 under a 2.0 target) in the AAA lane.
+
+What the PR changes, all of it portable as is:
+
+- **`finding_policy.conformance.legal_baseline`:** an optional
+  `{ name, version, level }`, validated so it can't sit above the target.
+  `applyFindingPolicy()` adds a `conformance_tier` to each finding:
+  - `legal`, a required finding within the baseline
+  - `target`, a required finding in the rest of the target
+  - `required`, when no baseline is configured
+  - otherwise the finding's obligation (`aspirational`, `advisory`,
+    `unmapped`, `not-applicable`)
+
+  Obligations themselves are unchanged, so the ACCESSIBILITY.md finding
+  schema vocabulary still holds. Out-of-target A/AA criteria now get
+  `not_required_for_conformance` instead of `wcag_aaa`.
+- **`src/lib/priority.js`:** ranks by tier first (`CONFORMANCE_TIER_ORDER`),
+  then by the old score.
+- **"Fix these first":** lists required findings only, with a new
+  "Requirement" column, for example "Legally required · WCAG 1.3.1 (2.0,
+  Level A)". AAA, best-practice and unmapped findings go in a separate
+  "Beyond the requirements" table. The "biggest win" callout, the fleet
+  table and each finding on the Accessibility page show the same label.
+- **Alfa best practices:** `scripts/generate-alfa-wcag-rules.mjs` now writes a
+  `best_practice` list to `src/data/alfa-wcag-rules.json`, taken from each
+  rule's own `requirements[]`. `classifyFinding()` and `classifyBaseLane()`
+  use it. Technique-only and requirement-less rules are deliberately left
+  Undetermined.
+- **Labels:** the 45 wrong labels are corrected against each rule's
+  `requirements[]` and `Outcomes`, `sia-r84` gets a label, and regression
+  tests are added.
+
+Still to do upstream:
+
+- **Set the baseline for the CMS fleet too.** CMS is a federal agency, so the
+  same Section 508 baseline applies:
+  `legal_baseline: { name: Section 508, version: "2.0", level: AA }`.
+- **Make the label check catch drift.** Store each label with the requirement
+  it was written against, for example
+  `"sia-r57": { "title": "...", "requirements": ["ARIA:landmark-regions"] }`.
+  `check:alfa-metadata` can then fail when the installed package's
+  `requirements[]` differ, which is when a label needs re-checking. Run it in
+  `tests.yml`, and after every `@siteimprove/alfa-rules` upgrade.
+- **Alfa severity.** Alfa has no impact levels. `severityFor()` gives every
+  Alfa finding "Moderate", raised to "Serious" when it affects half the pages
+  or more. So severity on Alfa AAA and best-practice findings says little.
+  The tier column now carries the meaning, but consider showing Alfa severity
+  as "—" or "Not rated".
+- **Show the tier in exports.** `conformance_tier` is in `bugs.json` and the
+  JSON API (both allow extra fields), but not yet in `bugs.csv`. Adding a
+  column changes `bugsCsvTable()` and the browser serializer that mirrors it.
+
+## 11. Setup documentation and a setup check
+
+Recorded 2026-10-25, from the NSF go-live.
+
+The README "Setup" section was written before scan data moved to its own repo
+on 2026-10-14. It has no step for the data repo, the deploy key or the
+`VITAL_DATA_DEPLOY_KEY` secret. ARCHITECTURE.md and CLAUDE.md mention the key
+only as something that already exists. So a new deployment that follows the
+README ends up where NSF did: every scan and report failed at the final push.
+Suggested replacement steps:
+
+1. Clone vital-core and push it to the new repo, so the history stays shared
+   with upstream (§1). Don't copy files or use "Use this template".
+2. Create a public `<name>-data` repo with an initial commit. Set `data_repo:`
+   and the `user_agent` contact URL in `config/targets.yml`. Set
+   `finding_policy.conformance` and, where a law applies, `legal_baseline`
+   (§10).
+3. Create a deploy key:
+   - public half on the data repo, with **Allow write access** ticked
+   - private half as the `VITAL_DATA_DEPLOY_KEY` *repository* secret in the
+     code repo
+4. Configure the code repo:
+   - Settings → Pages: source **GitHub Actions**
+   - Settings → Actions: **read and write** workflow permissions
+   - Issues turned on
+5. Run `scan` with the domain left blank and **Run report** ticked. Don't start
+   several scans at once: GitHub keeps only the newest waiting run.
+6. Check that it worked: commits in the data repo, the Pages site, and a
+   "Weekly scan reports" issue. A green run alone doesn't prove anything was
+   scanned.
+
+Also fix the "wasa" typo in the README's Hugging Face paragraph.
+
+**A `doctor` workflow.** A hand-run workflow that checks a deployment in under
+a minute, without loading any target site, and reports pass or fail for each
+item on the run page:
+
+- `targets.yml` and every profile parse
+- the data repo exists and is public
+- the secret is set and `git push --dry-run` is accepted (reuse
+  `scripts/check-data-push.sh`)
+- Pages is set to GitHub Actions, and Issues is on
+- the `scan-state` release can be created
+
+Run it after setting up a fleet and whenever settings change. It would have
+caught the NSF parse error and the missing deploy key on day one.
