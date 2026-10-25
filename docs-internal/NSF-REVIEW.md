@@ -124,20 +124,33 @@ pass locally.
    The data repo already exists, is public, and has an initial commit on
    `main`. That's enough for the checkout step.
 
-   **If the secret is missing or the key is read-only, nothing fails until the
-   push.** `actions/checkout` falls back to the workflow token when `ssh-key` is
-   empty. That token can read the public data repo but can't push to it. So
-   checkout and aggregate succeed, then "Commit data" (scan) or "Commit
-   summaries and pruning" (report) fails after 5 push attempts. Pages never
-   deploys, because it comes after that step. This happened in
-   [report run 40051043543](https://github.com/mgifford/vital-core-nsf/actions/runs/40051043543).
-   The failed step's log tells you which case you're in:
-   - `Permission to mgifford/vital-core-nsf-data.git denied to github-actions[bot]`:
-     the `VITAL_DATA_DEPLOY_KEY` secret is missing or misnamed in this repo.
+   **Push access is checked first.** Since
+   [PR #4](https://github.com/mgifford/vital-core-nsf/pull/4), `scan.yml` (the
+   `matrix` job) and `report.yml` (the `gate` job) each start with "Check data
+   repo push access" (`scripts/check-data-push.sh`). If the key can't push,
+   that step fails before any scan job starts or any NSF page is requested. Its
+   annotation, at the top of the run page, carries git's exact message.
+
+   Before that, `actions/checkout` silently fell back to the workflow token
+   when `ssh-key` was empty. That token can read the public data repo but not
+   push to it. So the whole scan ran, then "Commit data" failed after 5 push
+   attempts, after crawl state had already marked the pages scanned. That
+   happened on every run from 2026-10-24 (for example
+   [report run 40051043543](https://github.com/mgifford/vital-core-nsf/actions/runs/40051043543)).
+
+   What the annotation tells you:
+   - "The VITAL_DATA_DEPLOY_KEY repository secret is missing or empty": add
+     the private key as a **repository** secret in this repo, named exactly
+     that.
    - `The key you are authenticated with has been marked as read only`: the
      deploy key on the data repo doesn't have **Allow write access** ticked.
-   - `Permission denied (publickey)`: the secret doesn't match the public key on
-     the data repo.
+     Delete it and add it again with the box ticked.
+   - `Permission to … denied to deploy key`: the public key was added to the
+     wrong repo.
+   - `protected branch` or `rule violations`: a branch rule or ruleset on the
+     data repo's `main` blocks the key.
+   - `Permission denied (publickey)` (at the checkout step instead): the secret
+     doesn't match the public key on the data repo.
 10. **Keep the data repo public.** The report `gate` job reads
     `.repo-size-kb`, `.last-report-date` and the repo size through
     `gh api repos/<data_repo>` using the workflow's own `github.token`. That

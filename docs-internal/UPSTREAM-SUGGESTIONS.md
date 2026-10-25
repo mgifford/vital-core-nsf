@@ -217,14 +217,21 @@ Suggested changes, in order of value:
   `data/<domain>/<week>/pages/<pageId>.json` (`src/scan.js:421`), so scanning
   the same page twice in a week overwrites one file. At worst it adds an extra
   `runs/*.json` log.
-- **Fail fast on push access, before scanning.** Right after the data repo
-  checkout:
-  - fail with a clear `::error::` if the secret is empty (pass it through
-    `env:`, since `secrets` can't be read in `if:`)
-  - then run `git push --dry-run origin HEAD`
+- **Fail fast on push access, before scanning.** Implemented in
+  [vital-core-nsf#4](https://github.com/mgifford/vital-core-nsf/pull/4); it can
+  be ported as it is. `scripts/check-data-push.sh` does two things:
+  - fails with a clear `::error::` if the secret is empty (passed as
+    `HAS_DEPLOY_KEY` through `env:`, since `secrets` can't be read in `if:`)
+  - otherwise runs `git push --dry-run origin HEAD` and puts git's message in
+    the annotation
 
-  A read-only or missing key should then fail in seconds, without loading the
-  target site. Use the same check in `report.yml` before "Aggregate".
+  It runs early in each workflow:
+  - in the `scan.yml` `matrix` job, against a root-files-only checkout of the
+    data repo, so no scan job starts
+  - in the `report.yml` `gate` job, so the report job never builds
+
+  Annotations can be read through the checks API, unlike step logs, so the
+  cause shows on the run page.
 - **Don't let a data-repo problem take the site down.** In `report.yml`,
   "Configure Pages" and the deploy steps come after "Commit summaries and
   pruning". So a push failure also stops the site from updating, even though
