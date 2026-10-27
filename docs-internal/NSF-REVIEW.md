@@ -3,7 +3,89 @@
 Reviewed 2026-10-23 against `mgifford/vital-core-nsf` at `c3d3486` ("updating
 for nsf") and `mgifford/vital-core` at `f5bac30`.
 
-## Summary
+## Status at 2026-10-27
+
+**Live.** Since 2026-10-25, every scheduled scan and report has succeeded.
+`vital-core-nsf-data` has scan data for all five domains, including 2026-W44.
+Reports publish daily to <https://mgifford.github.io/vital-core-nsf/>, and
+weekly summaries go to the "Weekly scan reports" issue (#7).
+
+**Done:**
+
+| What | Where |
+|---|---|
+| `targets.yml` parse error; tests that assumed CMS targets | [#1](https://github.com/mgifford/vital-core-nsf/pull/1) |
+| Scheduled scans never started a domain with no crawl state | [#2](https://github.com/mgifford/vital-core-nsf/pull/2) |
+| A failed data push throws away the scan (recorded upstream) | [#3](https://github.com/mgifford/vital-core-nsf/pull/3) |
+| Push-access check runs before any scan or build | [#4](https://github.com/mgifford/vital-core-nsf/pull/4) |
+| Deploy key and `VITAL_DATA_DEPLOY_KEY` secret set up | repo settings |
+| Actions moved to Node 24 releases; `.nvmrc` holds the Node version; Dependabot for actions | [#6](https://github.com/mgifford/vital-core-nsf/pull/6) |
+| Legal baseline (Section 508, WCAG 2.0 AA) vs WCAG 2.2 AA target; separate AAA and best-practice list; 45 Alfa rule names fixed | [#8](https://github.com/mgifford/vital-core-nsf/pull/8) |
+| All of the above offered upstream, with setup docs | [vital-core#276](https://github.com/mgifford/vital-core/pull/276) |
+
+**Still open:**
+
+- **Join the history with upstream once vital-core#276 merges.** Use a real
+  merge, not the `-s ours` merge in step 3 below: both repos now carry the
+  same fixes, but only upstream has the new README and CLAUDE.md. Run
+  `git merge --allow-unrelated-histories upstream/main`. Resolve conflicts by
+  keeping this repo's `config/targets.yml`, `docs-internal/` and package
+  versions, and upstream's version of everything else.
+- **NSF wording in the docs.** The README introduction, `WAF-ALLOWLIST.md`,
+  `.well-known/*.json`, the MCP/API examples, `config/profiles/` (plus an
+  `nsf.yml` for dashboard branding), the spelling allowlist and the
+  `acr.js` feedback URL. See "CMS references" below. Upstream's planned
+  "instance identity" config block (UPSTREAM-SUGGESTIONS §2) would make most
+  of these unnecessary.
+- **NSF side:** tell NSF's web and Section 508 teams (step 14), and check
+  whether the sites use USWDS (step 15). The first scans show no firewall
+  blocking.
+- **Translations:** the new report text needs French, Japanese and Dutch.
+- **Dependabot:** review the security alerts it raises for this repo.
+- **Branch clean-up:** turn on Settings → General → "Automatically delete head
+  branches", so merged PR branches don't pile up.
+
+## Lessons learned
+
+1. **Check the config loads before pushing it.** A duplicate `targets:` key
+   stopped every workflow, and the tests only reported it indirectly. A
+   `check:config` step would name the line straight away.
+2. **A green run isn't proof that anything happened.** A manual scan "succeeded"
+   while skipping all five domains, and reports "succeeded" before any data
+   existed. Check outcomes instead: commits in the data repo, pages on the
+   site, the weekly issue.
+3. **Fail early, before touching target sites.** The missing deploy key only
+   showed up at the final push, after each run had crawled NSF. A preflight
+   check now stops the run in seconds and names the cause.
+4. **Do irreversible steps last.** Crawl progress was saved before the data
+   commit, so failed pushes threw away about 970 pages of scans while still
+   marking them done for the week.
+5. **Report errors where people and tools can read them.** Step logs couldn't
+   be fetched through the API, but annotations could. Putting git's message
+   in an annotation made the deploy-key problem diagnosable in one run.
+6. **Don't trust hand-maintained rule metadata.** 45 Alfa rule names
+   described other rules, and a "label exists" check never noticed. Derive
+   names from the installed package, and check them against it.
+7. **A finding isn't automatically a requirement.** Ranking only by pages
+   affected put AAA and best practices above legal requirements, and pushed
+   the legally required findings off the list. Rank and label by legal
+   baseline, then target, then AAA, then best practice.
+8. **Keep the fork connected to upstream.** Copying files into a new repo
+   created an unrelated history, so upstream fixes can't simply be merged.
+   New fleets should be cloned and pushed (README "Setup", step 1).
+9. **Update the setup docs when the architecture changes.** The README
+   predated the separate data repo, and following it reproduced every NSF
+   failure. A `doctor` setup-check workflow would catch the rest.
+10. **Small CI traps:**
+    - the `scan-global` concurrency group cancels queued runs, so start one
+      scan at a time
+    - `.gitignore`'s `data/` also matches `src/data/`, so `git add` refuses
+      the tracked `src/data/*.json`; use `git add -u`, or anchor the pattern
+      as `/data/`
+    - pin action versions and let Dependabot move them, rather than waiting
+      for deprecation warnings
+
+## Original review (2026-10-23)
 
 - **This repo is a copy of `vital-core` with one changed file.** A recursive diff
   against upstream `main` finds only `config/targets.yml` changed. Every doc,

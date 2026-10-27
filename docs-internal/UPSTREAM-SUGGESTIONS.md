@@ -8,6 +8,25 @@ Starting a new fleet should mean cloning, editing a few config files and
 setting secrets. Pulling in upstream improvements should be a conflict-free
 `git merge upstream/main`.
 
+**Status at 2026-10-27.**
+[vital-core#276](https://github.com/mgifford/vital-core/pull/276) ports the
+finished work: the tests from §5, the bug fixes in §6 and §10, the fail-fast
+push check from §7, the action updates (vital-core-nsf#6), the Setup rewrite
+from §11, and a Section 508 baseline for the CMS config. These sections are
+still only suggestions:
+
+- §1: repo layout and the rename caveat
+- §2: an instance-identity block
+- §3: fleet files kept apart from engine files
+- §4: generic report text
+- the rest of §7: commit before saving state, deploy Pages anyway, warn on an
+  empty matrix
+- §8: repo variables and keepalive
+- §9: a new-fleet script
+- the follow-ups at the end of §10
+- §11: the `doctor` workflow
+- §12, below
+
 ## 1. Repo layout and the rename plan
 
 The plan: rename `vital-core` → `vital-core-cms` and `vital-core-data` →
@@ -403,3 +422,25 @@ item on the run page:
 
 Run it after setting up a fleet and whenever settings change. It would have
 caught the NSF parse error and the missing deploy key on day one.
+
+## 12. Smaller things found on the way
+
+Recorded 2026-10-27.
+
+- **Anchor the data ignore rule.** `.gitignore`'s `data/` also matches
+  `src/data/`, so `git add src/data/alfa-wcag-rules.json` fails with "paths
+  are ignored" even though the file is tracked. That aborted a chained
+  commit during the NSF work. Use `/data/`, plus `/data/www.va.gov/` and the
+  other VA entries, so the rule only matches the checkout at the repo root.
+- **Make delete-on-merge the default.** Turn on Settings → General →
+  "Automatically delete head branches" in vital-core and every child repo, so
+  merged PR branches don't pile up.
+- **Clear the existing Dependabot security alerts.** vital-core-nsf inherited
+  10 on day one (5 high, 5 moderate) from the shared `package-lock.json`, and
+  they're cleared upstream once for every fleet. The github-actions
+  Dependabot config only covers action versions.
+- **Mention the session's restrictions in agent docs.** The Claude Code
+  session used for NSF couldn't open Actions step logs, call GraphQL (`gh pr
+  create`, `gh release download`), or reach the scanned sites. Workflows that
+  put their important errors in annotations (§7, `check-data-push.sh`) stay
+  diagnosable from such sessions.
