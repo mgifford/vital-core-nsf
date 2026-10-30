@@ -8,24 +8,37 @@ Starting a new fleet should mean cloning, editing a few config files and
 setting secrets. Pulling in upstream improvements should be a conflict-free
 `git merge upstream/main`.
 
-**Status at 2026-10-27.**
-[vital-core#276](https://github.com/mgifford/vital-core/pull/276) ports the
-finished work: the tests from §5, the bug fixes in §6 and §10, the fail-fast
-push check from §7, the action updates (vital-core-nsf#6), the Setup rewrite
-from §11, and a Section 508 baseline for the CMS config. These sections are
-still only suggestions:
+**Status at 2026-10-30.**
+[vital-core#276](https://github.com/mgifford/vital-core/pull/276) ported the
+finished work, and it has merged upstream and into this fleet (#10). That
+covers:
+
+- the tests from §5
+- the bug fixes in §6 and §10
+- the fail-fast push check from §7
+- the action updates (vital-core-nsf#6)
+- the Setup rewrite from §11
+- a Section 508 baseline for the CMS config
+
+Since then, upstream has also done these, merged into this fleet in #10:
+
+- §7, commit before saving state (vital-core `543d97f`)
+- §11, setting up from the template and joining the history (`cf6d844`)
+- the fleet `UPSTREAM-SUGGESTIONS.md` convention (`c6827d1`)
+
+These are still only suggestions:
 
 - §1: repo layout and the rename caveat
 - §2: an instance-identity block
 - §3: fleet files kept apart from engine files
 - §4: generic report text
-- the rest of §7: commit before saving state, deploy Pages anyway, warn on an
-  empty matrix
+- the rest of §7: deploy Pages anyway, warn on an empty matrix
 - §8: repo variables and keepalive
 - §9: a new-fleet script
 - the follow-ups at the end of §10
-- §11: the `doctor` workflow
-- §12, below
+- §11: the `doctor` setup check
+- §12
+- §13, filed
 
 ## 1. Repo layout and the rename plan
 
@@ -444,3 +457,30 @@ Recorded 2026-10-27.
   create`, `gh release download`), or reach the scanned sites. Workflows that
   put their important errors in annotations (§7, `check-data-push.sh`) stay
   diagnosable from such sessions.
+
+## 13. Bug: PDF checks fetch the same file twice under www. and the bare host
+
+Recorded 2026-10-30. **Status: filed**, not yet fixed in vital-core.
+
+**Evidence.** On ncses.nsf.gov at 2026-W44, `pdfInventory()` lists 6,194
+own-domain PDFs. 734 of them are under `www.ncses.nsf.gov`, and 396 of those
+also appear, with the same path, under `ncses.nsf.gov`. One example is
+`/pubs/ncses26006/assets/ncses26006.pdf`. The canonical-URL work
+(`resolveCanonicalOrigin()`, `normalizeUrl(…, canonicalOrigin)`) makes pages
+one record each, but the resource ledger keeps each PDF link's own host. So
+`pdfQueue()` downloads and analyses the same file twice, and the PDFs page
+lists it twice.
+
+**Suggested fix.** Key PDFs by `urlMatchKey()`, or by the site's canonical
+origin, when building the inventory and queue (`pdfInventory()` /
+`pdfQueue()` in `src/lib/pdf-audit.js`). Keep the first-seen URL for
+fetching, and merge `firstSeen`, `lastSeen` and the linking pages. Add a test
+with a `www.`/bare pair. Better still, normalize resource URLs the same way
+when the scan records them, so the inventory and the other resource reports
+gain from it too.
+
+**Also worth considering.** NCSES links to over 6,000 PDFs, so a first pass
+at the default `per_run: 25` takes about eight months. The setting works per
+target, so a fleet can raise it. Document the trade-off between load on the
+site and coverage, and perhaps show "N days to first full pass" on the PDFs
+page.

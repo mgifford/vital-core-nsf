@@ -54,6 +54,43 @@ targets:
   assert.equal(c.targets[0].design_system, 'cms-ds');
 });
 
+test('config: spelling_locale defaults to en-US, merges from defaults, and normalizes case', () => {
+  const c = loadConfig(`
+defaults:
+  spelling_locale: en-gb
+targets:
+  - domain: www.example.gov.uk
+  - domain: www.example.gc.ca
+    spelling_locale: EN-CA
+`);
+  assert.deepEqual(c.targets.map((t) => t.spelling_locale), ['en-GB', 'en-CA']);
+  assert.equal(loadConfig('targets:\n  - domain: example.gov\n').targets[0].spelling_locale, 'en-US');
+});
+
+test('config: government_domains adds a fleet\'s own namespaces, normalized, with a country', () => {
+  const c = loadConfig(`
+defaults:
+  government_domains:
+    - { suffix: GOB.MX, country: Mexico }
+targets:
+  - domain: www.sat.gob.mx
+  - domain: www.cms.gov
+    government_domains: []
+`);
+  assert.deepEqual(c.targets[0].governmentDomains, [{ suffix: '.gob.mx', country: 'Mexico' }]);
+  assert.deepEqual(c.targets[1].governmentDomains, []);
+  assert.deepEqual(loadConfig('targets:\n  - domain: example.gov\n').targets[0].governmentDomains, []);
+  assert.throws(() => loadConfig('targets:\n  - domain: a.mx\n    government_domains: [{ suffix: .gob.mx }]\n'), /needs a suffix such as "\.gob\.mx" and a country/);
+  assert.throws(() => loadConfig('targets:\n  - domain: a.mx\n    government_domains: .gob.mx\n'), /must be a list/);
+});
+
+test('config: an unsupported spelling_locale fails with the supported values', () => {
+  assert.throws(
+    () => loadConfig('targets:\n  - domain: example.gov.uk\n    spelling_locale: en-UK\n'),
+    /Unsupported spelling_locale "en-UK" in target example\.gov\.uk\. Supported: en-US, en-GB, en-CA, en-AU\./,
+  );
+});
+
 test('config: webmcpEnabled defaults to false when the flag is absent', () => {
   const c = loadConfig(`
 targets:

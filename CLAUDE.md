@@ -128,6 +128,15 @@ severity taxonomy and accessibility rules: a standing gate, not an afterthought.
   which CI checks out into `data/` and pushes with the `VITAL_DATA_DEPLOY_KEY`
   deploy key. The data repo carries its own copy of the VA `.gitignore`
   entries; `hf_only` targets may not set `data_repo`.
+- **`scripts/check-data-push.sh` runs first** in the scan matrix and report
+  gate jobs. Without a usable key, checkout falls back to a read-only token
+  and a run would otherwise crawl everything and then lose it at the push.
+  Keep the check ahead of any step that fetches target sites.
+- **The `diagnose` workflow refuses `hf_only` targets** too, by key or by
+  host with `www.` ignored (`resolveProbeTargets()` in `src/lib/probe.js`).
+  It pushes nothing, so it needs no data-push check, and it keeps only a
+  short header whitelist and cookie *names*: never store cookie values or
+  page bodies from it.
 
 ---
 
@@ -154,6 +163,124 @@ Priority tiers: 0 = Critical/Serious + WCAG A/AA; 1 = Critical/Serious +
 BP/Undetermined; 2 = Moderate/Minor + WCAG A/AA + ≥10 pages; 5 = hidden.
 
 ---
+
+## Conformance tiers (what a finding is required to meet)
+
+`finding_policy.conformance` holds the WCAG **target** (`version`/`level`,
+e.g. 2.2 AA) and an optional **`legal_baseline`** (`{ name, version, level }`,
+e.g. Section 508 = WCAG 2.0 AA; validated not to exceed the target).
+`applyFindingPolicy()` gives every finding a `conformance_tier`:
+
+| Tier | Meaning | Label |
+|---|---|---|
+| `legal` | required and within the legal baseline | Legally required |
+| `target` | required, beyond the baseline (e.g. 2.1/2.2 A/AA) | Target |
+| `required` | required, no baseline configured | Required |
+| `aspirational` | AAA under an AA target | Aspirational (AAA) |
+| `advisory` | best practice, or A/AA newer than the target | Best practice / Advisory |
+| `unmapped` | no WCAG mapping | Needs review |
+
+Rules to keep:
+
+- **Rank by tier first, then score.** `rankBugs()`/`fleetWorstOffenders()`
+  (`src/lib/priority.js`) do this.
+- **Never list AAA or best practice with requirements.** "Fix these first"
+  shows required tiers only; everything else goes in "Beyond the
+  requirements".
+- **Show the tier as text.** Use `requirementLabel()`/`requirementCell()` in
+  `src/report-html.js`, never color alone.
+- **Obligations don't change with the tier.** The tier only adds the
+  legal/target split.
+
+**Alfa metadata.** Each title in `config/alfa-rule-labels.json` must describe
+what the installed rule checks. Read its `requirements[]` and `Outcomes` in
+`node_modules/@siteimprove/alfa-rules/dist/sia-rN/rule.{js,d.ts}`; on
+2026-10-25, 45 titles had drifted onto other rules. After upgrading
+`@siteimprove/alfa-rules`, run `node scripts/generate-alfa-wcag-rules.mjs`.
+It rewrites the WCAG mapping and the `best_practice` list (rules that
+declare only a best practice or an ARIA practice). Re-apply the documented
+exception, then re-check the labels.
+
+---
+
+## Canonical URLs (one page, one record)
+
+Each scan follows the homepage's redirects once (`resolveCanonicalOrigin()`
+in `src/lib/canonical.js`) and records every same-site URL under that scheme
+and host: `normalizeUrl(raw, base, host, canonicalOrigin)`. So `http://` and
+`https://`, or apex and `www.`, forms of a page are one page, and a sitemap
+that lists `http://` URLs doesn't cost a redirect per page.
+
+- **Pass the canonical origin** wherever scan.js normalizes a URL (sitemap,
+  links, priority URLs, the homepage seed). Without it `normalizeUrl` keeps
+  the link's own scheme and host.
+- **Old crawl state is rewritten** on load (`canonicalizeState()`),
+  merging duplicates without losing this week's coverage.
+- **A page that lands elsewhere on the site** is recorded under the landing
+  URL; the requested URL stays in the frontier as `lastStatus: 'redirect'`
+  with `redirectTo`, gets no page record, and isn't rescanned that week.
+- **No HTTPS is a finding, not a failure.** If `https://` fails and
+  `http://` answers, the site is scanned over http and "Served over HTTPS"
+  fails with the reason (`httpsProblem`); an HTTPS-to-HTTP redirect fails it
+  too. A site where nothing answers keeps its configured origin.
+- **Matching ignores the form.** The URL lookup and key-page matching
+  compare `urlMatchKey()` (no scheme, `www.` or fragment), so stored URLs
+  from before this change still match.
+
+## Blocked sites (say so, up front)
+
+A firewall, robots.txt or a network block stopping the scanner is the first
+thing a reader needs to know, so it is never silent. It sits near the top as
+a `<details>` whose summary names the count and the sites: easy to see
+without getting in the way.
+
+- **A challenge page is not the site.** `detectBlock()` (`src/lib/access.js`)
+  treats HTTP 202, `x-amzn-waf-action` or `cf-mitigated` as a firewall
+  challenge, and 401/403/429 as a refusal. The page record gets `blocked:
+  { kind, status, by }` and no audit runs. Older records count by status
+  (`withoutBlockedAudits()` strips their audit results before summarizing,
+  in the inventory and in the URL index).
+- **`summary.access`** (`assessAccess()`) is `blocked` (nothing audited),
+  `partial` (≥10% of attempted pages stopped by a firewall or robots.txt),
+  `ok` or `not-scanned`, with firewall, robots.txt (`runLog.robots`) and
+  connection details. Targets with no page data still get an access status
+  from their run logs.
+- **Show it.** `accessAlert()` sits right under the dashboard intro and lists
+  every blocked, partly blocked, unreachable or not-yet-scanned target with
+  its cause as text and what to ask the site for; `accessBanner()` opens the
+  landing and accessibility pages (expanded only when nothing was audited).
+  Blocked targets are never ranked. Keep headings out of `<summary>` (its
+  button role hides them from some screen readers); the `<section>` is
+  labelled by the summary text instead.
+- **Failed pages come back.** `failCount >= 3` keeps a page out only for the
+  week it last failed (`lastFailedWeek`); it is tried once more each week.
+
+## PDF checks (pdf-audit)
+
+The scans list each site's PDFs in `data/<domain>/resources.json`; the
+`pdf-audit` workflow checks them with
+[pdf-crawler](https://github.com/mgifford/pdf-crawler)'s
+`scripts/analyse_files.py`, and `aggregate` renders a PDFs page per domain
+(`renderPdfsPage()`, latest week only) from `data/<domain>/pdf-audit.json`.
+
+- **Own domain only.** `ownDomain()` (`src/lib/pdf-audit.js`) compares
+  registrable domains (`tldts-icann`); PDFs on other organisations' hosts
+  are counted on the page but never fetched, and `fetchPdf()`
+  (`src/lib/pdf-fetch.js`) refuses a redirect that leaves the domain.
+- **The setting decides the daily run, not the manual one.** `pdf_audit`
+  (off by default) selects sites for the cron; a manual run for one named
+  site works whatever its setting. Both refuse `hf_only` targets
+  (`selectTargets()` in `scripts/pdf-audit.js`), and `check-data-push.sh`
+  runs before anything is fetched.
+- **Queue order** (`pdfQueue()`): never checked, newest `firstSeen` first;
+  failures from an earlier ISO week, up to three attempts; checks older
+  than `recheck_days`. Rechecks are conditional (ETag / Last-Modified) and an
+  unchanged MD5 keeps its result without analysis.
+- **The checker is pinned.** `PDF_CRAWLER_REF` in `pdf-audit.yml` is a
+  pdf-crawler commit; bump it as a reviewed change, and keep
+  `analyse_files.py`'s input and output shapes stable upstream.
+- **Store results, never files.** Only `compactReport()`'s fields go into
+  `pdf-audit.json`; downloads are deleted after analysis.
 
 ## URL exclusion (three layers)
 
@@ -304,6 +431,41 @@ unaffected.
 
 ---
 
+## Fleets made from this template
+
+vital-core is a GitHub template. Each fleet (e.g. `vital-core-nsf`,
+`vital-core-lgd`) is a repo made from it and joined to its history (README,
+"Setting up a new instance").
+
+**vital-core is itself a fleet: CMS.** Every CMS site is in the US, so its
+`config/targets.yml`, `config/profiles/`, Section 508 `legal_baseline`,
+`en-US` `spelling_locale` and the US-government framing in `AGENTS.md` are
+correct here. Don't generalize them in vital-core; a new fleet replaces them
+in its own repo. Engine code (`src/`, workflows, scripts) is shared by every
+fleet, so it must not assume the US: make anything country-specific a
+setting, with the CMS value as the default.
+
+When working in a fleet repo rather than `mgifford/vital-core`:
+
+- **Fleet-only changes stay in the fleet:** `config/targets.yml`,
+  `config/profiles/`, the README introduction.
+- **Anything every fleet would want goes upstream:** an engine bug, a US-only
+  assumption, a gap in the docs. Record it in the fleet's
+  `docs-internal/UPSTREAM-SUGGESTIONS.md` with evidence and a status line,
+  then fix it in vital-core.
+- **Make upstream fixes on a branch from `upstream/main`** and open the PR on
+  vital-core; after it merges, run `git merge upstream/main` in the fleet. If
+  the fleet can't wait, merge that same branch into the fleet too: both repos
+  then hold the same commits and the later merge is clean. Never copy a
+  change across by hand; copied changes conflict on the next merge.
+- **Keep the status line current:** filed, PR open, merged upstream, merged
+  into the fleet, or dropped (and why).
+
+vital-core never ships `docs-internal/UPSTREAM-SUGGESTIONS.md`, so a fleet's
+copy never conflicts with upstream.
+
+---
+
 ## Static JSON API
 
 `npm run aggregate` writes a versioned static JSON API to `docs/api/v1/` alongside
@@ -319,6 +481,15 @@ the HTML reports. Files are gitignored locally and deployed to GitHub Pages.
 
 **Schema version**: `schema_version: "1"` in every file. Bump to `"2"` only with a
 breaking change; add the new path under `api/v2/` and keep `v1/` until consumers migrate.
+
+**Never serialize a summary as is.** A summary carries per-page lists in
+memory for the CSVs and engine pages (`HEAVY_SUMMARY_KEYS` in
+`src/lib/trend.js`); `summary.json` is written through `omitHeavyLists`. The
+published series (`weekly.json`, `domain.json`, the API snapshot) goes through
+`trendSeries()`: what failed each week as numbers, without passes or the
+evidence repeated every week. Serializing whole summaries for 21 weeks pushed
+`www.medicaid.gov`'s files to ~400 MB each and past V8's maximum string
+length; the trend is ~3 MB.
 
 **No server required** — these are pre-built static files. The `src/lib/api-writer.js`
 module builds them; `src/aggregate.js` calls `writeApiFiles()` once at the end of each run.

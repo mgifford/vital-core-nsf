@@ -1,15 +1,16 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
-import { loadConfig, loadProfile, applyProfile, DIRS } from './lib/config.js';
+import { loadConfig, loadProfile, applyProfile, DIRS, DEFAULT_SPELLING_LOCALE } from './lib/config.js';
 import { isoWeek, compareWeeks, weekToDateStamp } from './lib/week.js';
 const filePfx = (domain, week) => `${domain}_${weekToDateStamp(week)}`;
-import { renderDomainReport, renderIndex, writeAsset, setSustainabilityMetric, setLocale, setReportLanguages, renderLighthousePage, renderReadabilityPage, renderTechPage, renderArchivePage, renderAccessibilityPage, renderStandardsPage, renderSecurityPage, renderErrorsPage, renderImagesPage, renderTechFindingsPage, renderThirdPartyPage, renderUrlLookup, renderHistoryPage, redirectStub, PAGE_REDIRECTS } from './report-html.js';
+import { renderDomainReport, renderIndex, writeAsset, setSustainabilityMetric, setLocale, setReportLanguages, renderLighthousePage, renderReadabilityPage, renderTechPage, renderArchivePage, renderAccessibilityPage, renderStandardsPage, renderSecurityPage, renderErrorsPage, renderImagesPage, renderPdfsPage, renderTechFindingsPage, renderThirdPartyPage, renderUrlLookup, renderHistoryPage, redirectStub, PAGE_REDIRECTS } from './report-html.js';
 import { buildBugReports, bugReportsMarkdown } from './lib/bug-report.js';
 import { loadPriorityUrls } from './lib/top-tasks.js';
 import { loadFindings, saveFindings, updateFindings } from './lib/findings.js';
 import { weekDeltas, severityBurndown, streaks, deltaSeries } from './lib/progress.js';
-import { writeCsvs, writeBugsCsv, writeErrorsCsv, writeResourceCsv, writeLighthouseCsv, writeLighthouseJson, writeReadabilityCsv, writeSpellingCsv, writeAcronymsCsv, writeTechCsv, writeImagesCsv, writeThirdPartyCsv, writePriorityPages, writeComponentClusterCsvs, writeTrendsCsv } from './lib/csv.js';
+import { loadPdfLedger, pdfReportView } from './lib/pdf-audit.js';
+import { writeCsvs, writeBugsCsv, writeErrorsCsv, writeResourceCsv, writeLighthouseCsv, writeLighthouseJson, writeReadabilityCsv, writeSpellingCsv, writeAcronymsCsv, writeTechCsv, writeImagesCsv, writePdfsCsv, writeThirdPartyCsv, writePriorityPages, writeComponentClusterCsvs, writeTrendsCsv } from './lib/csv.js';
 import { buildConsensus } from './lib/consensus.js';
 import { loadInventory, saveInventory, updateInventory, inventorySummary } from './lib/inventory.js';
 import { resolvePageRecord } from './lib/page-records.js';
@@ -25,6 +26,9 @@ import { buildIndexEntry, buildSnapshot, buildWeekFindings, writeApiFiles } from
 import { filterBugsByExclusion } from './report-html.js';
 import { redactBugs } from './lib/api-redact.js';
 import { buildUrlIndex, writeUrlIndex } from './lib/url-index.js';
+import { assessAccess, withoutBlockedAudits } from './lib/access.js';
+import { omitHeavyLists, trendSeries } from './lib/trend.js';
+import { withCurrentGovernmentCheck } from './engines/security.js';
 import { buildLlmsTxt } from './lib/llms-txt.js';
 import { writeApiCatalog } from './lib/api-catalog.js';
 import { summarizeDistribution } from './lib/distribution.js';
@@ -75,6 +79,9 @@ function apiBugsFor(target, bugs) {
 }
 
 const dashboard = [];
+// Configured targets with no page data yet, with their access status from
+// run logs, so the dashboard can say why instead of leaving them out.
+const unscanned = [];
 const apiIndexEntries = [];
 const apiSnapshots = [];
 const apiWeekFindings = [];
@@ -82,7 +89,10 @@ const urlLookupDomains = [];
 
 for (const target of config.targets) {
   const domainDir = path.join(DIRS.data, target.key);
-  if (!fs.existsSync(domainDir)) continue;
+  if (!fs.existsSync(domainDir)) {
+    unscanned.push({ target, access: assessAccess() });
+    continue;
+  }
   const reporting = target.reporting ?? {};
   const keyPages = reporting.include_key_page_issues ? loadPriorityUrls(target) : [];
 
@@ -93,9 +103,6 @@ for (const target of config.targets) {
     const summary = summarizeWeek(target, week);
     if (summary) {
       series.push(summary);
-      // The full per-page lists are large and reconstructable; keep them
-      // in memory for CSV generation but don't commit them to summary.json.
-      const omit = new Set(['pagesWithAxeList', 'pagesWithAlfaList', 'pageDetail', 'pageRows', 'bytesList', 'imageRows', 'uniqueImageList']);
       const summaryPath = path.join(domainDir, week, 'summary.json');
       // summarizeRecords() stamps a fresh generatedAt on every call, even
       // for weeks whose underlying page data hasn't changed since the last
@@ -104,19 +111,23 @@ for (const target of config.targets) {
       // retained week's summary.json daily forever, even when nothing else
       // differs — compare content ignoring generatedAt and skip the write
       // (and the timestamp bump) when nothing real changed.
-      const nextJson = JSON.stringify(summary, (k, v) => (omit.has(k) || k === 'generatedAt' ? undefined : v), 1);
+      const nextJson = JSON.stringify(summary, (k, v) => (k === 'generatedAt' ? undefined : omitHeavyLists(k, v)), 1);
       const prevJson = fs.existsSync(summaryPath)
-        ? JSON.stringify(JSON.parse(fs.readFileSync(summaryPath, 'utf8')), (k, v) => (omit.has(k) || k === 'generatedAt' ? undefined : v), 1)
+        ? JSON.stringify(JSON.parse(fs.readFileSync(summaryPath, 'utf8')), (k, v) => (k === 'generatedAt' ? undefined : omitHeavyLists(k, v)), 1)
         : null;
       if (nextJson !== prevJson) {
         fs.writeFileSync(
           summaryPath,
-          JSON.stringify(summary, (k, v) => (omit.has(k) ? undefined : v), 1)
+          JSON.stringify(summary, omitHeavyLists, 1)
         );
       }
     }
   }
-  if (series.length === 0) continue;
+  if (series.length === 0) {
+    const lastWeek = weeks[weeks.length - 1];
+    unscanned.push({ target, access: assessAccess({ runs: lastWeek ? readRunLogs(path.join(domainDir, lastWeek, 'runs')) : [] }) });
+    continue;
+  }
 
   // Rolling site inventory: last-known status for every URL ever scanned.
   // Updated incrementally from each retained week's page records (older
@@ -128,7 +139,7 @@ for (const target of config.targets) {
     const records = fs.readdirSync(pagesDir)
       .filter((f) => f.endsWith('.json'))
       .map((f) => resolvePageRecord(domainDir, JSON.parse(fs.readFileSync(path.join(pagesDir, f), 'utf8'))));
-    updateInventory(inventory, week, records);
+    updateInventory(inventory, week, withoutBlockedAudits(records));
   }
   saveInventory(target.key, inventory);
   const invSummary = inventorySummary(inventory, series[series.length - 1].week);
@@ -143,7 +154,8 @@ for (const target of config.targets) {
   // History & Trends page).
   const dataOut = path.join(DIRS.docs, 'data', target.key);
   fs.mkdirSync(dataOut, { recursive: true });
-  fs.writeFileSync(path.join(dataOut, 'weekly.json'), JSON.stringify({ domain: target.domain, series, diffs }, null, 1));
+  const trend = trendSeries(series);
+  fs.writeFileSync(path.join(dataOut, 'weekly.json'), JSON.stringify({ domain: target.domain, series: trend, diffs }, null, 1));
   writeTrendsCsv(dataOut, series);
 
   // Findings ledger: first/last-seen per unique finding (pattern_id),
@@ -366,9 +378,15 @@ for (const target of config.targets) {
 
     // inventory totals only make sense on the latest week's report.
     const isLatest = i === series.length - 1;
+    let pdfView = null;
+    let pdfCsv = null;
     if (isLatest) {
       latestBugs = reportBugs.map((b) => ({ ...b, _week: summary.week }));
       latestPolicySummary = policyResult.suppressionSummary;
+      // PDF results describe each PDF as last checked, so only the latest
+      // week shows them; resLedger already holds this week's inventory.
+      pdfView = pdfReportView(resLedger.resources, loadPdfLedger(target.key, target.domain), target.domain, { enabled: target.pdfAudit?.enabled });
+      pdfCsv = writePdfsCsv(repDir, target.domain, summary.week, pdfView);
     }
 
     // Render the configured languages. Sustainability (sustainable-web-output):
@@ -411,9 +429,10 @@ for (const target of config.targets) {
       fs.writeFileSync(path.join(repDir, `fast${sfx}.html`), renderLighthousePage(target, summary, lhCsv, lhJson, series));
       fs.writeFileSync(path.join(repDir, `findable${sfx}.html`), renderReadabilityPage(target, summary, readabilityCsv));
       fs.writeFileSync(path.join(repDir, `tech${sfx}.html`), renderTechPage(target, summary, techCsv));
-      fs.writeFileSync(path.join(repDir, `tech-findings${sfx}.html`), renderTechFindingsPage(target, summary));
+      fs.writeFileSync(path.join(repDir, `tech-findings${sfx}.html`), renderTechFindingsPage(target, summary, reportBugs, target.url_exclude_patterns ?? []));
       fs.writeFileSync(path.join(repDir, `third-parties${sfx}.html`), renderThirdPartyPage(target, summary, tpCsv));
       fs.writeFileSync(path.join(repDir, `images${sfx}.html`), renderImagesPage(target, summary, imagesCsv));
+      fs.writeFileSync(path.join(repDir, `pdfs${sfx}.html`), renderPdfsPage(target, summary, pdfView, pdfCsv));
       // History & Trends page (issue #180). Written for every week so the
       // subnav link resolves from any week's report.
       fs.writeFileSync(path.join(repDir, `history${sfx}.html`), renderHistoryPage(target, series, summary.week));
@@ -464,7 +483,7 @@ for (const target of config.targets) {
   const latestSummary = series[series.length - 1];
   const latestBugsOnly = apiBugsFor(target, latestBugs.map(({ _week, ...b }) => b));
   apiIndexEntries.push(buildIndexEntry(target, latestSummary, latestBugsOnly));
-  apiSnapshots.push({ key: target.key, data: buildSnapshot(target, series, diffs, ledger, invSummary, latestBugsOnly, latestPolicySummary) });
+  apiSnapshots.push({ key: target.key, data: buildSnapshot(target, trend, diffs, ledger, invSummary, latestBugsOnly, latestPolicySummary) });
 
   const urlIdx = buildUrlIndex(domainDir, target.domain, latestSummary.week);
   if (urlIdx) {
@@ -496,8 +515,8 @@ for (const target of config.targets) {
         // Latest week's tech↔finding associations (lift-ranked), for anyone
         // building cross-site analyses. The full model lives in weekly.series.
         techFindings: latest.techFindings?.associations ?? null,
-        // Week-over-week trend series + diffs.
-        weekly: { series, diffs },
+        // Week-over-week trend series (what failed each week) + diffs.
+        weekly: { series: trend, diffs },
       },
       null,
       1
@@ -520,7 +539,7 @@ for (const locale of config.languages) {
   setLocale(locale);
   setReportLanguages(config.languages, config.defaultLanguage, config.showLanguageSwitcher);
   const sfx = locale === config.defaultLanguage ? '' : `-${locale}`;
-  fs.writeFileSync(path.join(DIRS.docs, `index${sfx}.html`), renderIndex(dashboard, { branding: profile?.branding }));
+  fs.writeFileSync(path.join(DIRS.docs, `index${sfx}.html`), renderIndex(dashboard, { branding: profile?.branding, unscanned }));
   if (urlLookupDomains.length) {
     fs.writeFileSync(path.join(DIRS.docs, `url-lookup${sfx}.html`), renderUrlLookup(urlLookupDomains));
   }
@@ -534,6 +553,10 @@ console.log('docs/ written');
 
 // ---------------------------------------------------------------------
 
+function currentSecurity(target, security) {
+  return withCurrentGovernmentCheck(security, target.domain, target.governmentDomains);
+}
+
 function summarizeWeek(target, week) {
   const domainDir = path.join(DIRS.data, target.key);
   const pagesDir = path.join(domainDir, week, 'pages');
@@ -541,12 +564,15 @@ function summarizeWeek(target, week) {
 
   // If page detail was pruned, reuse the committed summary verbatim.
   if (!fs.existsSync(pagesDir)) {
-    return fs.existsSync(summaryPath) ? JSON.parse(fs.readFileSync(summaryPath, 'utf8')) : null;
+    if (!fs.existsSync(summaryPath)) return null;
+    const summary = JSON.parse(fs.readFileSync(summaryPath, 'utf8'));
+    if (summary.security) summary.security = currentSecurity(target, summary.security);
+    return summary;
   }
 
-  const records = fs.readdirSync(pagesDir)
+  const records = withoutBlockedAudits(fs.readdirSync(pagesDir)
     .filter((f) => f.endsWith('.json'))
-    .map((f) => resolvePageRecord(domainDir, JSON.parse(fs.readFileSync(path.join(pagesDir, f), 'utf8'))));
+    .map((f) => resolvePageRecord(domainDir, JSON.parse(fs.readFileSync(path.join(pagesDir, f), 'utf8')))));
   if (records.length === 0) return null;
 
   const runsDir = path.join(DIRS.data, target.key, week, 'runs');
@@ -557,6 +583,7 @@ function summarizeWeek(target, week) {
     summary.pagesAttempted = tally.attempted;
     summary.pagesSucceeded = tally.succeeded;
   }
+  if (summary) summary.access = assessAccess({ records, runs: readRunLogs(runsDir) });
   return summary;
 }
 
@@ -584,7 +611,7 @@ function summarizeWindow(target, days = 7) {
   if (records.length === 0) return null;
   const broken = readBrokenLinks(runDirs, cutoff);
   const tally = readTallyTotals(runDirs, cutoff);
-  const s = summarizeRecords(target, 'last-7-days', records, broken);
+  const s = summarizeRecords(target, 'last-7-days', withoutBlockedAudits(records), broken);
   if (s) {
     s.windowDays = days;
     if (tally) { s.pagesAttempted = tally.attempted; s.pagesSucceeded = tally.succeeded; }
@@ -614,6 +641,13 @@ function readTallyTotals(runsDirOrDirs, sinceMs = null) {
     }
   }
   return found ? { attempted, succeeded } : null;
+}
+
+/** Every run log in a runs directory, parsed; [] when there is none. */
+function readRunLogs(runsDir) {
+  if (!fs.existsSync(runsDir)) return [];
+  return fs.readdirSync(runsDir).filter((f) => f.endsWith('.json'))
+    .map((f) => JSON.parse(fs.readFileSync(path.join(runsDir, f), 'utf8')));
 }
 
 /** Fold broken links from one or more runs dirs (optionally since cutoff ms). */
@@ -650,12 +684,19 @@ function summarizeRecords(target, week, records, brokenLinks) {
   // Progressive Web Resilience (per-page): checkId -> { label, pass, total, why, evidenceExamples }.
   const resilienceChecks = {};
   let resiliencePages = 0;
-  // Security (per-origin): keep the latest result seen this week.
+  // Per-origin results (security, public interest, offline resilience): keep
+  // the most recently scanned. Records are read in file-name order, which
+  // says nothing about when each was scanned.
   let securityLatest = null;
-  // Public-interest checks (per-origin): keep the latest result seen this week.
   let publicInterestLatest = null;
-  // Offline/network resilience (per-origin): keep the latest result seen this week.
   let offlineResilienceLatest = null;
+  const scannedAtOf = {};
+  const newest = (engine, rec) => {
+    const at = rec.scannedAt ?? '';
+    if (scannedAtOf[engine] != null && at < scannedAtOf[engine]) return false;
+    scannedAtOf[engine] = at;
+    return true;
+  };
   let pagesScanned = 0;
   let pagesWithAxeViolations = 0;
   let pagesWithAlfaFailures = 0;
@@ -686,6 +727,7 @@ function summarizeRecords(target, week, records, brokenLinks) {
   // so a scraped word like "constructor" must not resolve through Object.prototype.
   const acronymCounts = Object.create(null); // acronym -> { pages, examplePages[] }
   const misspellingCounts = Object.create(null); // word -> { pages, examplePages[] }
+  const spellingLocales = new Set();
   const plRows = []; // per-page readability rows (for CSV)
   let plPagesChecked = 0; // pages plain-language ran on (for words/page)
   const wordCounts = []; // per-page main-content word counts
@@ -796,9 +838,9 @@ function summarizeRecords(target, week, records, brokenLinks) {
         }
       }
     }
-    if (rec.security) securityLatest = rec.security; // per-origin; latest wins
-    if (rec.offlineResilience) offlineResilienceLatest = rec.offlineResilience; // per-origin; latest wins
-    if (rec.publicInterest) publicInterestLatest = rec.publicInterest; // per-origin; latest wins
+    if (rec.security && newest('security', rec)) securityLatest = rec.security;
+    if (rec.offlineResilience && newest('offlineResilience', rec)) offlineResilienceLatest = rec.offlineResilience;
+    if (rec.publicInterest && newest('publicInterest', rec)) publicInterestLatest = rec.publicInterest;
     if (rec.tech) {
       for (const d of rec.tech) {
         const existing = techDetections.get(d.name);
@@ -819,12 +861,16 @@ function summarizeRecords(target, week, records, brokenLinks) {
       }
       // Tech↔finding row for this page: the technologies on it paired with the
       // accessibility findings on it. Keyed engine:ruleId. Only built for pages
-      // with tech data so the co-occurrence denominator is well-defined.
-      const findings = [
-        ...Object.keys(rec.axe?.violations ?? {}).map((id) => `axe:${id}`),
-        ...Object.keys(rec.alfa?.failed ?? {}).map((id) => `alfa:${id}`),
-      ];
-      techFindingPages.push({ techs: rec.tech.map((d) => d.name), findings });
+      // with tech data and an accessibility audit, naming the engines that ran
+      // so each finding is compared across the pages its engine checked.
+      const engines = [rec.axe && 'axe', rec.alfa && 'alfa'].filter(Boolean);
+      if (engines.length) {
+        const findings = [
+          ...Object.keys(rec.axe?.violations ?? {}).map((id) => `axe:${id}`),
+          ...Object.keys(rec.alfa?.failed ?? {}).map((id) => `alfa:${id}`),
+        ];
+        techFindingPages.push({ techs: rec.tech.map((d) => d.name), findings, engines });
+      }
     }
     if (rec.thirdParty) {
       // hasFindings: did this page have any accessibility finding? Used to
@@ -875,6 +921,8 @@ function summarizeRecords(target, week, records, brokenLinks) {
     }
     if (rec.plainLanguage) {
       plPagesChecked++;
+      // Records from before spelling_locale existed were all checked in US English.
+      spellingLocales.add(rec.plainLanguage.spellingLocale ?? DEFAULT_SPELLING_LOCALE);
       if (typeof rec.plainLanguage.wordCount === 'number') wordCounts.push(rec.plainLanguage.wordCount);
       // Per-page readability row (for the readability CSV).
       plRows.push({
@@ -1031,7 +1079,7 @@ function summarizeRecords(target, week, records, brokenLinks) {
         }
       : null,
     security: securityLatest
-      ? { checks: securityLatest.checks, passed: securityLatest.passed, total: securityLatest.total }
+      ? currentSecurity(target, { checks: securityLatest.checks, passed: securityLatest.passed, total: securityLatest.total })
       : null,
     publicInterest: publicInterestLatest ?? null,
     plainLanguage: plPagesChecked
@@ -1047,6 +1095,7 @@ function summarizeRecords(target, week, records, brokenLinks) {
             .sort((a, b) => b[1].pages - a[1].pages)
             .slice(0, 15)
             .map(([acronym, e]) => ({ acronym, pages: e.pages, examplePages: e.examplePages })),
+          spellingLocales: [...spellingLocales].sort(),
           // Most common misspellings, by pages affected (with examples).
           topMisspellings: Object.entries(misspellingCounts)
             .sort((a, b) => b[1].pages - a[1].pages)
