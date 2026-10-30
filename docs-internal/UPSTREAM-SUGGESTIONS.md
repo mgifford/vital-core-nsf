@@ -39,6 +39,7 @@ These are still only suggestions:
 - §11: the `doctor` setup check
 - §12
 - §13, filed
+- §14, filed
 
 ## 1. Repo layout and the rename plan
 
@@ -458,26 +459,64 @@ Recorded 2026-10-27.
   put their important errors in annotations (§7, `check-data-push.sh`) stay
   diagnosable from such sessions.
 
-## 13. Bug: PDF checks fetch the same file twice under www. and the bare host
+## 14. Fleet merges: re-check upstream right before merging
+
+Recorded 2026-10-30. **Status: filed.**
+
+**Evidence.** vital-core-nsf#10 merged vital-core up to `7c1444f`. While it
+was open, vital-core#290 merged upstream at 12:35 UTC. #10 was merged without
+it, and a second PR (#11) brought #290 in. Separately, a follow-up push to
+#10's branch landed after the merge; delete-on-merge had removed the branch,
+so the push quietly re-created it.
+
+**Suggestion.** Add two lines to `CLAUDE.md`, "Fleets made from this
+template":
+
+- Before merging an upstream-merge PR in a fleet, run
+  `git fetch upstream main && git log HEAD..upstream/main` on its branch. If
+  anything is listed, merge again first.
+- Merge it with "Create a merge commit". A squash or rebase drops the link to
+  upstream.
+
+The same checks could also run in CI: a fleet job that warns when an open
+upstream-merge PR is behind `upstream/main`.
+
+## 13. Bug: PDF links keep their own scheme and host, so checks fail or repeat
 
 Recorded 2026-10-30. **Status: filed**, not yet fixed in vital-core.
 
-**Evidence.** On ncses.nsf.gov at 2026-W44, `pdfInventory()` lists 6,194
-own-domain PDFs. 734 of them are under `www.ncses.nsf.gov`, and 396 of those
-also appear, with the same path, under `ncses.nsf.gov`. One example is
-`/pubs/ncses26006/assets/ncses26006.pdf`. The canonical-URL work
-(`resolveCanonicalOrigin()`, `normalizeUrl(…, canonicalOrigin)`) makes pages
-one record each, but the resource ledger keeps each PDF link's own host. So
-`pdfQueue()` downloads and analyses the same file twice, and the PDFs page
-lists it twice.
+The canonical-URL work (`resolveCanonicalOrigin()`,
+`normalizeUrl(…, canonicalOrigin)`) makes pages one record each. The resource
+ledger, though, keeps each PDF link exactly as it was found, with its own
+scheme and host. `pdfInventory()` and `pdfQueue()` then use those raw URLs.
 
-**Suggested fix.** Key PDFs by `urlMatchKey()`, or by the site's canonical
-origin, when building the inventory and queue (`pdfInventory()` /
-`pdfQueue()` in `src/lib/pdf-audit.js`). Keep the first-seen URL for
-fetching, and merge `firstSeen`, `lastSeen` and the linking pages. Add a test
-with a `www.`/bare pair. Better still, normalize resource URLs the same way
-when the scan records them, so the inventory and the other resource reports
-gain from it too.
+**Evidence, from ncses.nsf.gov at 2026-W44** (6,194 own-domain PDFs):
+
+- **Failed checks.** 1,320 PDF links are `http://ncses.nsf.gov/…`, and 4,131
+  are `https://ncses.nsf.gov/…`. The first pdf-audit run (vital-core-nsf,
+  2026-10-30 12:48 UTC, checker `9f079ba`) took the 25 newest, which were
+  all `http://`. All 25 failed with "connection reset", for example
+  `http://ncses.nsf.gov/1139/assets/0/file/ncses_sed.pdf`. Until those 1,320
+  have failed three times in three different weeks, NCSES's daily runs will
+  mostly hit them.
+- **Repeated checks.** 734 links are under `www.ncses.nsf.gov`, and 396 of
+  those also appear, with the same path, under `ncses.nsf.gov`, for example
+  `/pubs/ncses26006/assets/ncses26006.pdf`. Each would be downloaded,
+  analysed and listed twice.
+
+(Many of the `http://` links were recorded before the canonical-URL change
+reached this fleet. Whether new scans still add them depends on whether
+resource URLs go through `normalizeUrl` with the canonical origin.)
+
+**Suggested fix.** Rewrite own-domain PDF URLs to the site's canonical
+origin, and key them by `urlMatchKey()`, when building the inventory and
+queue (`pdfInventory()` / `pdfQueue()` in `src/lib/pdf-audit.js`). Merge
+`firstSeen`, `lastSeen` and the linking pages. Fetch `https://` first and fall
+back to the URL as found. Add tests with an `http`/`https` pair and a
+`www.`/bare pair. Better still, normalize resource URLs the same way when the
+scan records them, so the other resource reports gain from it too. Then
+rewrite existing ledgers on load, as `canonicalizeState()` does for crawl
+state.
 
 **Also worth considering.** NCSES links to over 6,000 PDFs, so a first pass
 at the default `per_run: 25` takes about eight months. The setting works per

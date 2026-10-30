@@ -24,7 +24,8 @@ weekly summaries go to the "Weekly scan reports" issue (#7).
 | All of the above offered upstream, with setup docs | [vital-core#276](https://github.com/mgifford/vital-core/pull/276), merged |
 | History joined to vital-core (`f5bac30` recorded as the shared base), then upstream merged: PDF checks, blocked-site notices, canonical URLs, spelling locale, diagnose workflow | [#10](https://github.com/mgifford/vital-core-nsf/pull/10) |
 | PDF checks on for every NSF site (`pdf_audit` in `defaults`) | [#10](https://github.com/mgifford/vital-core-nsf/pull/10) |
-| Delete-on-merge turned on for this repo | repo settings |
+| vital-core#290 (`setup-uv` v10.3.3 for pdf-audit), which merged upstream while #10 was open | [#11](https://github.com/mgifford/vital-core-nsf/pull/11) |
+| Delete-on-merge turned on; every merged branch deleted | repo settings |
 
 **Pulling in upstream from now on** is an ordinary
 `git fetch upstream main && git merge upstream/main`, on a branch, opened as a
@@ -43,13 +44,33 @@ NSF's own domain:
 | seedfund.nsf.gov | 7 | 1 day |
 | par.nsf.gov | 0 | — |
 
-Newest files go first. 396 NCSES PDFs are listed under both `ncses.nsf.gov`
-and `www.ncses.nsf.gov`, so until that's fixed upstream they're checked
-twice (UPSTREAM-SUGGESTIONS §13). Raising NCSES's `pdf_audit.per_run`
-would shorten the first pass but put more load on NCSES each day, so the
-upstream default stays for now. The first daily run is at 22:41 UTC. To see
-results sooner, run Actions → pdf-audit by hand for `iucrc.nsf.gov` or
-`seedfund.nsf.gov`, which have only a few files each.
+Newest files go first. Raising NCSES's `pdf_audit.per_run` would shorten the
+first pass but put more load on NCSES each day, so the upstream default stays
+for now. The daily run is at 22:41 UTC.
+
+**First run** (by hand, 2026-10-30 12:48 UTC; results committed to the data
+repo):
+
+| Site | Checked | Analysed | Failed, and why |
+|---|---|---|---|
+| www.nsf.gov | 25 | 22 | 2 return 404, 1 redirects to a web page instead of a PDF |
+| seedfund.nsf.gov | 7 | 6 | 1 large PDF took longer than the 120 s analysis limit |
+| iucrc.nsf.gov | 7 | 3 | 1 returns 404, 1 redirects to a web page, 1 over the time limit, 1 blocked by `robots.txt` (skipped, as it should be) |
+| ncses.nsf.gov | 25 | 0 | all 25 "connection reset" on `http://` links |
+
+- **The 404s and redirects are real findings:** broken PDF links on NSF's
+  sites.
+- **NCSES is an engine bug** (UPSTREAM-SUGGESTIONS §13). NCSES's link list has
+  1,320 `http://` PDF links, recorded before the canonical-URL change. NCSES
+  resets plain-`http` connections from the fetcher, and the newest links,
+  which go first, are `http://`. Until vital-core fixes this, NCSES's daily
+  runs will mostly fail fast. That costs NCSES little, because nothing is
+  downloaded. The same bug makes 396 NCSES PDFs appear twice, under `www.`
+  and the bare host. To stop the failing NCSES checks before the fix lands,
+  set `pdf_audit: { enabled: false }` on the ncses.nsf.gov target.
+- **This run used the old `setup-uv`.** It started on #10's code, a minute
+  before #11 merged, so it warned that `setup-uv@v6` targets Node 20. Later
+  runs use v10.3.3.
 
 **Still open:**
 
@@ -64,8 +85,8 @@ results sooner, run Actions → pdf-audit by hand for `iucrc.nsf.gov` or
   blocking.
 - **Translations:** the new report text needs French, Japanese and Dutch.
 - **Dependabot:** review the security alerts it raises for this repo.
-- **Branch clean-up:** delete `docs/session-learnings`. It merged as #9,
-  before delete-on-merge was on.
+- **The PDF duplicate-host bug** (UPSTREAM-SUGGESTIONS §13): fix in
+  vital-core, then `git merge upstream/main` here.
 
 ## Lessons learned
 
@@ -106,6 +127,36 @@ results sooner, run Actions → pdf-audit by hand for `iucrc.nsf.gov` or
       as `/data/`
     - pin action versions and let Dependabot move them, rather than waiting
       for deprecation warnings
+11. **Upstream keeps moving, so check again just before merging.**
+    vital-core#290 landed while #10 was open, and #10 merged before a
+    follow-up push reached it; that took a second PR, #11. Before merging
+    an upstream-merge PR, run
+    `git fetch upstream main && git log main..upstream/main` on its branch.
+    If anything is listed, merge again first. Before pushing to any PR
+    branch, check that the PR is still open: with delete-on-merge on, a push
+    to a merged PR's branch quietly re-creates it.
+12. **Tooling trap: per-branch fetch settings break `git fetch`.** A shallow
+    clone that adds one `remote.origin.fetch` line per branch fails with
+    "couldn't find remote ref" once delete-on-merge removes that branch, so
+    later fetches stop updating `origin/main`. Remove the line
+    (`git config --unset-all remote.origin.fetch '^\+refs/heads/<branch>:'`)
+    and fetch with `--prune`.
+
+## Close-out checklist
+
+Run this before ending a work session. Each check is about the end state, not
+whether the steps went green.
+
+- `git fetch upstream main && git log origin/main..upstream/main` is empty:
+  NSF has every vital-core commit.
+- `git diff upstream/main origin/main -- . ':!config/targets.yml' ':!docs-internal/NSF-REVIEW.md' ':!docs-internal/UPSTREAM-SUGGESTIONS.md'`
+  is empty: the engine is identical to vital-core.
+- The last scheduled `scan` and `report` runs succeeded, and the data repo
+  has new commits.
+- No open PRs from the session in either repo, and `main` is the only branch
+  on vital-core-nsf.
+- Anything every fleet would want is in `UPSTREAM-SUGGESTIONS.md`, with a
+  status line.
 
 ## Original review (2026-10-23)
 
