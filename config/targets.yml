@@ -21,6 +21,12 @@ defaults:
   retention_weeks: 2        # page-level detail kept this long; weekly summaries kept forever
   user_agent: "vital-scans/0.1 (+https://github.com/mgifford/vital-core-nsf; accessibility and sustainability monitoring)"
   spelling_locale: en-US     # dictionary for spell checks: en-US, en-GB, en-CA or en-AU (per-target override below)
+  # Check the PDFs each NSF site links to (the pdf-audit workflow, daily):
+  # up to 25 PDFs per site per run, from the site's own domain only, each
+  # downloaded once and re-validated every 90 days. Results appear on each
+  # site's PDFs page under "Accessible?". See pdf_audit under targets below.
+  pdf_audit:
+    enabled: true
   reporting:
     max_html_issues: 50
     moderate_issue_threshold_percent: 5
