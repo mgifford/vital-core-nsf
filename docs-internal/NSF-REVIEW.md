@@ -3,7 +3,7 @@
 Reviewed 2026-10-23 against `mgifford/vital-core-nsf` at `c3d3486` ("updating
 for nsf") and `mgifford/vital-core` at `f5bac30`.
 
-## Status at 2026-10-27
+## Status at 2026-10-30
 
 **Live.** Since 2026-10-25, every scheduled scan and report has succeeded.
 `vital-core-nsf-data` has scan data for all five domains, including 2026-W44.
@@ -21,16 +21,38 @@ weekly summaries go to the "Weekly scan reports" issue (#7).
 | Deploy key and `VITAL_DATA_DEPLOY_KEY` secret set up | repo settings |
 | Actions moved to Node 24 releases; `.nvmrc` holds the Node version; Dependabot for actions | [#6](https://github.com/mgifford/vital-core-nsf/pull/6) |
 | Legal baseline (Section 508, WCAG 2.0 AA) vs WCAG 2.2 AA target; separate AAA and best-practice list; 45 Alfa rule names fixed | [#8](https://github.com/mgifford/vital-core-nsf/pull/8) |
-| All of the above offered upstream, with setup docs | [vital-core#276](https://github.com/mgifford/vital-core/pull/276) |
+| All of the above offered upstream, with setup docs | [vital-core#276](https://github.com/mgifford/vital-core/pull/276), merged |
+| History joined to vital-core (`f5bac30` recorded as the shared base), then upstream merged: PDF checks, blocked-site notices, canonical URLs, spelling locale, diagnose workflow | [#10](https://github.com/mgifford/vital-core-nsf/pull/10) |
+| PDF checks on for every NSF site (`pdf_audit` in `defaults`) | [#10](https://github.com/mgifford/vital-core-nsf/pull/10) |
+| Delete-on-merge turned on for this repo | repo settings |
+
+**Pulling in upstream from now on** is an ordinary
+`git fetch upstream main && git merge upstream/main`, on a branch, opened as a
+PR and merged with **"Create a merge commit"**. A squash or rebase merge
+drops the link to upstream, and the next merge then conflicts. Upstream fixes
+are made in vital-core first (CLAUDE.md, "Fleets made from this template").
+
+**PDF checks: what to expect.** At 2026-W44 the sites link to 6,481 PDFs on
+NSF's own domain:
+
+| Site | Own-domain PDFs | First pass at 25 a day |
+|---|---|---|
+| ncses.nsf.gov | 6,194 | about 8 months |
+| www.nsf.gov | 273 | about 11 days |
+| iucrc.nsf.gov | 7 | 1 day |
+| seedfund.nsf.gov | 7 | 1 day |
+| par.nsf.gov | 0 | — |
+
+Newest files go first. 396 NCSES PDFs are listed under both `ncses.nsf.gov`
+and `www.ncses.nsf.gov`, so until that's fixed upstream they're checked
+twice (UPSTREAM-SUGGESTIONS §13). Raising NCSES's `pdf_audit.per_run`
+would shorten the first pass but put more load on NCSES each day, so the
+upstream default stays for now. The first daily run is at 22:41 UTC. To see
+results sooner, run Actions → pdf-audit by hand for `iucrc.nsf.gov` or
+`seedfund.nsf.gov`, which have only a few files each.
 
 **Still open:**
 
-- **Join the history with upstream once vital-core#276 merges.** Use a real
-  merge, not the `-s ours` merge in step 3 below: both repos now carry the
-  same fixes, but only upstream has the new README and CLAUDE.md. Run
-  `git merge --allow-unrelated-histories upstream/main`. Resolve conflicts by
-  keeping this repo's `config/targets.yml`, `docs-internal/` and package
-  versions, and upstream's version of everything else.
 - **NSF wording in the docs.** The README introduction, `WAF-ALLOWLIST.md`,
   `.well-known/*.json`, the MCP/API examples, `config/profiles/` (plus an
   `nsf.yml` for dashboard branding), the spelling allowlist and the
@@ -42,8 +64,8 @@ weekly summaries go to the "Weekly scan reports" issue (#7).
   blocking.
 - **Translations:** the new report text needs French, Japanese and Dutch.
 - **Dependabot:** review the security alerts it raises for this repo.
-- **Branch clean-up:** turn on Settings → General → "Automatically delete head
-  branches", so merged PR branches don't pile up.
+- **Branch clean-up:** delete `docs/session-learnings`. It merged as #9,
+  before delete-on-merge was on.
 
 ## Lessons learned
 
