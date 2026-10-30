@@ -84,6 +84,10 @@ Other deliberate choices:
 3. After the night's scans finish, the `report` workflow aggregates the
    week, deploys the reports to GitHub Pages, and prunes page-level
    detail older than `retention_weeks`.
+4. Optionally, the `pdf-audit` workflow checks the PDFs each site links to
+   (daily, for sites with `pdf_audit: { enabled: true }`, or for one site
+   from Actions → pdf-audit), and the next report shows them on that
+   site's PDFs page.
 
 For how crawling, storage, and the pipeline work in more detail, see
 **[ARCHITECTURE.md](ARCHITECTURE.md)**.
@@ -95,19 +99,130 @@ For how crawling, storage, and the pipeline work in more detail, see
 GitHub is the source of truth for this project. The `main` branch keeps
 the full working history, and that is where development should land.
 
-Hugging Face Spaces has been archived. It wasa deployment target, not a second source branch:
+Hugging Face Spaces has been archived. It was a deployment target, not a second source branch:
 it should receive a clean snapshot of the current site state on its own
 `main` branch, with large `state/` crawl artifacts stripped out before
 push.
 
-1. Create a repository from these files and push to GitHub.
-2. Edit `config/targets.yml`: list your 5–10 domains and adjust budgets.
-3. In repository **Settings → Pages**, set the source to **GitHub
-   Actions**.
-4. In **Settings → Actions → General**, allow workflows **read and
-   write permissions**.
-5. Run the `scan` workflow once manually (Actions → scan → Run
-   workflow) to verify, then run `report` to publish the first reports.
+### Setting up a new instance
+
+An instance is two repositories: this code (the workflows, `config/`) and a
+companion **data repository** that CI commits scan results to. Every step
+below is needed; a missing one tends to fail quietly, late in a run.
+
+1. **Create the code repo from the template, then join its history to
+   upstream.** This repository is a GitHub template: choose **Use this
+   template → Create a new repository**, leaving "Include all branches"
+   unticked. GitHub starts the new repo with one "Initial commit" that
+   copies these files but not their history, so `git merge upstream/main`
+   can't work until the two histories are joined. Join them once, straight
+   away. It changes no files:
+   ```sh
+   git clone git@github.com:<owner>/<name>.git
+   cd <name>
+   git remote add upstream https://github.com/mgifford/vital-core
+   git fetch upstream main
+   # The upstream commit that "Initial commit" was copied from:
+   ROOT_TREE=$(git rev-parse "$(git rev-list --max-parents=0 HEAD)^{tree}")
+   BASE=$(git log --format='%H %T' upstream/main | awk -v t="$ROOT_TREE" '$2 == t { print $1; exit }')
+   if [ -n "$BASE" ]; then
+     git merge -s ours --allow-unrelated-histories "$BASE" \
+       -m "Record vital-core ${BASE:0:7} as upstream base"
+     git push
+   else
+     echo "No upstream commit matches the initial commit." >&2
+   fi
+   ```
+   If no commit matches, the first commit isn't an unchanged copy of an
+   upstream commit, so don't guess one. Never run the `-s ours` merge
+   against `upstream/main` itself: it records every upstream change made
+   since the copy as merged without applying it.
+
+   Instead of the template, you can clone this repository and push it to a
+   new, empty repo (`git remote rename origin upstream`, then add your repo
+   as `origin`). That keeps the shared history from the start, with no join
+   step.
+
+   A repo made from the template has the scheduled scan and report
+   workflows switched on from its first commit, with this repo's targets in
+   `config/targets.yml`. Until step 4 they stop at the push-access check
+   without fetching any site, so finish step 3 before adding the key.
+2. **Create the data repo:** a **public** repository such as `<name>-data`,
+   with an initial commit (a README is enough). It must be public: the
+   report's `gate` job reads its marker files with the workflow's own token.
+3. **Edit `config/targets.yml`:**
+   - list your domains and adjust budgets
+   - set `data_repo:` to the data repo
+   - point the `user_agent` contact URL at your repo
+   - set `report_base_url:` to `https://<owner>.github.io/<name>`; CSV
+     links, `llms.txt` and the API catalog are built from it
+   - set `finding_policy.conformance` (the WCAG target) and, where a law
+     sets a lower minimum, `legal_baseline` (for US federal sites, Section
+     508: WCAG 2.0 AA). The shipped default is Section 508, so change or
+     remove it for any other jurisdiction
+   - cut `languages:` down to the ones your readers need. Every listed
+     language is built and deployed on each report run, even with the
+     switcher hidden
+
+   Run `npm run test:unit` before pushing; it fails on a config that
+   doesn't load.
+4. **Add a deploy key so CI can push scan data:**
+   - `ssh-keygen -t ed25519 -N "" -C "<name> Actions" -f data-key`
+   - add `data-key.pub` to the **data repo** → Settings → Deploy keys, with
+     **Allow write access** ticked
+   - add the private `data-key` file, including its BEGIN/END lines, to the
+     **code repo** → Settings → Secrets and variables → Actions, as the
+     repository secret **`VITAL_DATA_DEPLOY_KEY`**
+   - delete both local files
+
+   Without the key, checkout quietly falls back to a read-only token. The
+   "Check data repo push access" step now stops the run first, and its
+   annotation names the cause.
+5. **In the code repo's settings:**
+   - **Pages:** set the source to **GitHub Actions**
+   - **Actions → General:** allow workflows **read and write permissions**
+   - **Issues:** keep them enabled; the report workflow posts a "Weekly
+     scan reports" issue
+6. **Run the first scan:** Actions → scan → Run workflow, with the domain
+   left blank, a small budget (e.g. 10) and **Run report** ticked. Start one
+   scan at a time: the `scan-global` concurrency group keeps only the
+   newest waiting run and cancels the others.
+7. **Check that it really worked.** A green run alone doesn't prove anything
+   was scanned. Look for:
+   - new commits in the data repo
+   - the site at `https://<owner>.github.io/<name>/`
+   - the "Weekly scan reports" issue
+
+   A site the scanner couldn't get into is listed at the top of the
+   dashboard under "Sites blocking the scanner", with the cause: a firewall
+   rule, robots.txt or no connection. For the details, run Actions →
+   **diagnose** with that domain. It shows what the site sends
+   the scanner from GitHub's network: each redirect hop, the firewall or CDN
+   in front of it, whether a desktop browser gets a different answer,
+   `robots.txt` and the sitemap, and what a slow homepage was still loading.
+   Locally, `npm run diagnose -- <domain>` does the same from your network.
+
+### Taking upstream updates
+
+```sh
+git fetch upstream main
+git merge upstream/main
+```
+
+Conflicts should only appear in files you changed yourself. A fix that
+reached both repos by copying rather than merging (for example, one you
+made in your repo and then ported upstream) can conflict once. Take
+upstream's version (`git checkout --theirs <file>`) unless you meant to keep
+yours. For `package-lock.json`, take upstream's version, then run `npm ci`
+to confirm it still matches `package.json`.
+
+### Sending discoveries upstream
+
+Keep a `docs-internal/UPSTREAM-SUGGESTIONS.md` in your repo for anything
+every instance would want: an engine bug, a US-only assumption, a missing
+setup step. vital-core never ships that file, so it never conflicts. Fix
+those things in vital-core, on a branch from `upstream/main`, then merge
+upstream into your repo. See CLAUDE.md, "Fleets made from this template".
 
 ## Local use
 
@@ -181,6 +296,9 @@ pages, for an in-browser agent instead of a local coding client — see
 The crawler honors `robots.txt` (Disallow/Allow/Crawl-delay),
 identifies itself with a user agent containing a contact URL, scans one
 page at a time per domain with a configurable delay, and runs at night.
+PDF checks follow the same rules: one PDF at a time, only from the site's
+own domain, each downloaded once and then re-validated with a conditional
+request at most every 90 days.
 If you operate a site being scanned and want changes, open an issue.
 
 ## Honest limits

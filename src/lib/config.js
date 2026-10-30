@@ -6,6 +6,13 @@ import { DEFAULT_FINDING_POLICY, mergeFindingPolicy, validateFindingPolicy } fro
 
 const ROOT = path.resolve(new URL('../..', import.meta.url).pathname);
 const DESIGN_SYSTEMS = new Set(['none', 'cms-ds', 'uswds']);
+export const SPELLING_DICTIONARIES = {
+  'en-US': 'dictionary-en',
+  'en-GB': 'dictionary-en-gb',
+  'en-CA': 'dictionary-en-ca',
+  'en-AU': 'dictionary-en-au',
+};
+export const DEFAULT_SPELLING_LOCALE = 'en-US';
 const DEFAULT_DATA_REPO = 'mgifford/vital-core-data';
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 
@@ -93,6 +100,9 @@ export function loadConfig(rawYaml) {
       }
       t.design_system = ds;
     }
+    t.spelling_locale = resolveSpellingLocale(t.spelling_locale, `target ${t.domain}`);
+    t.governmentDomains = resolveGovernmentDomains(t.government_domains, `target ${t.domain}`);
+    t.pdfAudit = resolvePdfAudit({ ...(defaults.pdf_audit ?? {}), ...(t.pdf_audit ?? {}) }, `target ${t.domain}`);
   }
   return {
     defaults,
@@ -113,6 +123,43 @@ function validateDataRepo(repo, where) {
     throw new Error(`data_repo "${repo}" in ${where} must look like "owner/name".`);
   }
   return repo;
+}
+
+function resolveSpellingLocale(value, where) {
+  if (value == null) return DEFAULT_SPELLING_LOCALE;
+  const locale = Object.keys(SPELLING_DICTIONARIES).find((l) => l.toLowerCase() === String(value).toLowerCase());
+  if (!locale) {
+    throw new Error(`Unsupported spelling_locale "${value}" in ${where}. Supported: ${Object.keys(SPELLING_DICTIONARIES).join(', ')}.`);
+  }
+  return locale;
+}
+
+export const PDF_AUDIT_DEFAULTS = { enabled: false, per_run: 25, max_file_mb: 25, per_file_timeout: 120, recheck_days: 90 };
+
+function resolvePdfAudit(value, where) {
+  const unknown = Object.keys(value).filter((k) => !(k in PDF_AUDIT_DEFAULTS));
+  if (unknown.length) throw new Error(`Unknown pdf_audit key(s) ${unknown.join(', ')} in ${where}. Known: ${Object.keys(PDF_AUDIT_DEFAULTS).join(', ')}.`);
+  const v = { ...PDF_AUDIT_DEFAULTS, ...value };
+  if (typeof v.enabled !== 'boolean') throw new Error(`pdf_audit.enabled in ${where} must be true or false.`);
+  for (const k of ['per_run', 'max_file_mb', 'per_file_timeout', 'recheck_days']) {
+    if (!(typeof v[k] === 'number' && v[k] > 0)) throw new Error(`pdf_audit.${k} in ${where} must be a positive number.`);
+  }
+  return { enabled: v.enabled, perRun: Math.floor(v.per_run), maxFileMb: v.max_file_mb, perFileTimeout: Math.floor(v.per_file_timeout), recheckDays: v.recheck_days };
+}
+
+const SUFFIX_RE = /^\.?[a-z0-9-]+(\.[a-z0-9-]+)*$/;
+
+function resolveGovernmentDomains(value, where) {
+  if (value == null) return [];
+  if (!Array.isArray(value)) throw new Error(`government_domains in ${where} must be a list of { suffix, country }.`);
+  return value.map((d) => {
+    const suffix = String(d?.suffix ?? '').trim().toLowerCase();
+    const country = String(d?.country ?? '').trim();
+    if (!SUFFIX_RE.test(suffix) || !country) {
+      throw new Error(`government_domains entry ${JSON.stringify(d)} in ${where} needs a suffix such as ".gob.mx" and a country.`);
+    }
+    return { suffix: suffix.startsWith('.') ? suffix : `.${suffix}`, country };
+  });
 }
 
 // CI checks out one data repo into data/ for every non-hf_only target, so a

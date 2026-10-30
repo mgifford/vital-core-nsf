@@ -376,6 +376,12 @@ The per-domain options:
   medical jargon, agency acronyms) the spell checker should accept,
   layered on top of the project-wide `config/spelling-allowlist.txt`.
 
+- **`spelling_locale:`** — which English the spell checker accepts:
+  `en-US` (default), `en-GB`, `en-CA` or `en-AU`, set in `defaults:` or
+  per target. Only that dictionary is loaded during a scan. Each
+  plain-language record stores the locale it used, and the readability
+  page names it, so a switch shows up as a labelled step in the trend.
+
 - **`sampling:`** — a target may override any per-engine coverage rate
   from the global `sampling:` block (e.g. run Lighthouse on more or fewer
   of one site's pages).
@@ -398,6 +404,11 @@ report.yml    (after the night's scans complete)
   ├─ src/prune.js       drop page detail older than retention_weeks
   ├─ commit summaries back into data/
   └─ deploy docs/ to GitHub Pages
+
+pdf-audit.yml (daily for sites with pdf_audit enabled; manual for one site)
+  └─ scripts/pdf-audit.js   queue PDFs from data/<domain>/resources.json,
+                            download them, check them with pdf-crawler,
+                            commit data/<domain>/pdf-audit.json
 ```
 
 The scan pipeline is responsible for **collecting evidence**.

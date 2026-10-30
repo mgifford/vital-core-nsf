@@ -4,7 +4,7 @@ import { scoreFor, trajectory, scoreMeaning } from './lib/score.js';
 import { rankBugs, fleetWorstOffenders, mergeFleetPatterns, rankFleetPatterns, tierOf, isRequiredFinding } from './lib/priority.js';
 import { prioritizeAccessibilityBugs } from './lib/accessibility-priority.js';
 import { performanceImpact } from './lib/perf-impact.js';
-import { mergeFleet, rankFleetAssociations } from './lib/tech-findings.js';
+import { mergeFleet, rankFleetAssociations, rankAssociations, onNearlyEveryPage } from './lib/tech-findings.js';
 import { buildLineManifest, buildMultiLineManifest } from './lib/paracharts.js';
 import { rulePlainLabel } from './lib/rule-label.js';
 import { t, nf, getLocale, setLocale } from './lib/i18n.js';
@@ -297,6 +297,7 @@ const PAGES = {
   overview: 'index',
   accessibility: 'accessible',
   images: 'images',
+  pdfs: 'pdfs',
   lighthouse: 'fast',
   readability: 'findable',
   standards: 'standards',
@@ -336,7 +337,7 @@ function pageHref(key, anchor = '') {
  */
 const SUBNAV_GROUPS = [
   { label: null, items: [['overview', 'Overview']] },
-  { label: 'Accessible?', items: [['accessibility', 'Accessibility'], ['images', 'Images']] },
+  { label: 'Accessible?', items: [['accessibility', 'Accessibility'], ['images', 'Images'], ['pdfs', 'PDFs']] },
   { label: 'Fast?', items: [['lighthouse', 'Lighthouse']] },
   { label: 'Findable?', items: [['readability', 'Readability'], ['standards', 'Standards']] },
   { label: 'Trustworthy?', items: [['security', 'Security'], ['third-party', 'Third parties'], ['errors', 'Errors']] },
@@ -386,12 +387,13 @@ export function redirectStub(dest, lang = getLocale()) {
  * Keeps the full shared nav so navigation never breaks and the page reads as
  * "we evaluate this, there just wasn't data this week" rather than 404.
  */
-function emptyCriterionPage(target, summary, { active, label, message }) {
+function emptyCriterionPage(target, summary, { active, label, message, extra = '' }) {
   const L = t(label);
   const body = `
 <h1>${esc(target.domain)}: ${esc(L)} — ${t('week @week', { '@week': esc(summary.week) })}</h1>
 ${subnav(active)}
 <p class="meta">${esc(t(message))}</p>
+${extra}
 <p class="note">${t('This criterion is evaluated for every domain, but a given week\'s sample may not include pages with data for it. Check the <a href="archive.html">archive</a> for other weeks, or the <a href="index.html">overview</a>.')}</p>`;
   return layout({
     title: `${target.domain} ${L} ${summary.week} | vital-scans`,
@@ -1835,13 +1837,25 @@ function bugDeepLinkScript() {
     if (prev) prev.classList.remove('target-bug');
     var hash = window.location.hash.slice(1);
     if (!hash) return;
-    var summary = document.getElementById(hash);
-    if (!summary || summary.tagName !== 'SUMMARY') return;
-    var details = summary.closest('details');
-    if (details) details.open = true;
-    summary.classList.add('target-bug');
-    summary.scrollIntoView();
-    summary.focus();
+    var target = document.getElementById(hash);
+    if (!target) return;
+    var details = target.closest('details');
+    if (!details) return;
+    if (target.tagName === 'SUMMARY') {
+      // A link to a finding outside the default view (best practice, or few
+      // pages) would land on nothing, so switch to "Show everything" first.
+      var all = document.getElementById('filter-all');
+      if (details.hidden && details.getAttribute('data-excluded') !== '1' && all && !all.checked && window.__vitalApplyFilter) {
+        all.checked = true;
+        window.__vitalApplyFilter();
+      }
+    } else if (target.tagName !== 'TR') {
+      return;
+    }
+    details.open = true;
+    target.classList.add('target-bug');
+    target.scrollIntoView();
+    target.focus();
   }
   window.addEventListener('hashchange', goToTarget);
   // A permalink click when the URL hash is already this finding's id (e.g.
@@ -1863,7 +1877,7 @@ function bugDeepLinkScript() {
  */
 function overflowFindings(overflowBugs, csvBugsHref) {
   if (!overflowBugs || overflowBugs.length === 0) return '';
-  const rows = overflowBugs.map((b) => `<tr>
+  const rows = overflowBugs.map((b) => `<tr id="${esc(b.instance_id)}" tabindex="-1">
 <td><span class="sev-badge">${esc(t(b.severity))}</span></td>
 <td>${b.rule_url ? `<a href="${esc(b.rule_url)}">${esc(b.summary)}</a>` : esc(b.summary)} <span class="bug-meta">[${esc(b.rule_id)}]</span></td>
 <td>${b.wcag_category ? esc(t(b.wcag_category)) : ''}</td>
@@ -3086,6 +3100,15 @@ function scoredLabel(r) {
   return reason === 'non-prose' ? t('not prose (tables/data)') : t('too little text');
 }
 
+function spellingLocaleLabel(locale) {
+  switch (locale) {
+    case 'en-GB': return t('British English');
+    case 'en-CA': return t('Canadian English');
+    case 'en-AU': return t('Australian English');
+    default: return t('US English');
+  }
+}
+
 /**
  * Standalone readability page: a sortable table of every prose page with
  * its word count, Flesch Reading Ease and Flesch-Kincaid grade, plus
@@ -3113,6 +3136,10 @@ export function renderReadabilityPage(target, summary, csvHref) {
   });
   const acronyms = summary.plainLanguage?.topUnexplainedAcronyms ?? [];
   const misspellings = summary.plainLanguage?.topMisspellings ?? [];
+  const spellingLocales = summary.plainLanguage?.spellingLocales?.length ? summary.plainLanguage.spellingLocales : ['en-US'];
+  const dictionaryNote = spellingLocales.length === 1
+    ? t('Checked against the @dictionary dictionary.', { '@dictionary': spellingLocaleLabel(spellingLocales[0]) })
+    : t('Checked against the @dictionary dictionaries.', { '@dictionary': spellingLocales.map(spellingLocaleLabel).join(', ') });
   const body = `
 <h1>${esc(target.domain)}: ${t("Readability")} — ${t('week @week', { '@week': esc(summary.week) })}</h1>
 ${subnav('readability')}
@@ -3138,7 +3165,7 @@ ${heading('h-acronyms', t('Unexplained acronyms'))}
 </section>` : ''}
 ${misspellings.length ? `<section aria-labelledby="h-spelling">
 ${heading('h-spelling', t('Possible misspellings'))}
-<p class="meta">${t('Main-content words not found in the dictionary or the project allowlist, by pages affected. Government and medical jargon may be false positives — add real terms to <code>config/spelling-allowlist.txt</code>.')}${downloadLinks(summary.plainLanguage?.spellingCsv, summary.plainLanguage?.spellingJson)}</p>
+<p class="meta">${t('Main-content words not found in the dictionary or the project allowlist, by pages affected. Government and medical jargon may be false positives — add real terms to <code>config/spelling-allowlist.txt</code>.')} ${dictionaryNote}${downloadLinks(summary.plainLanguage?.spellingCsv, summary.plainLanguage?.spellingJson)}</p>
 <ul>${misspellings.map((m) => `<li><code>${esc(m.word)}</code> — ${t('@n page(s)', { '@n': m.pages })}</li>`).join('')}</ul>
 </section>` : ''}`;
   return layout({
@@ -3233,59 +3260,75 @@ function findingLabel(key) {
 }
 
 /**
- * Tech ↔ issues page: surfaces accessibility findings that are statistically
- * over-represented on pages running a given technology. The signal is lift
- * (how much more likely a finding is on pages with the tech vs. its overall
- * rate). High lift across many pages is a candidate systemic issue — a barrier
- * that travels with a CMS/theme/widget rather than with any one page's content.
+ * Tech ↔ issues page: accessibility findings more common on pages running a
+ * technology than on pages without it (rankAssociations). A strong pair over
+ * many pages is a candidate systemic issue — a barrier that travels with a
+ * CMS/theme/widget rather than with any one page's content.
  *
- * Association is not causation: the page says "associated with", and notes that
- * a stack of technologies detected on the same pages will share lift values
+ * Association is not causation: the page says so, and notes that a stack of
+ * technologies detected on the same pages shows the same numbers
  * (collinearity), so the implicated component still needs human confirmation.
  */
-export function renderTechFindingsPage(target, summary) {
+export function renderTechFindingsPage(target, summary, bugs = [], excludePatterns = []) {
   const tf = summary.techFindings;
-  if (!tf || !tf.associations?.length) {
-    return emptyCriterionPage(target, summary, { active: 'tech-findings', label: 'Technology ↔ issues', message: 'No technology-to-finding associations cleared the support threshold this week (need enough pages where both technology detection and an accessibility engine ran).' });
+  // Ranked here from the stored counts, so older weeks follow today's rule.
+  const associations = tf?.model ? rankAssociations(tf.model, { minPages: 5, limit: 50 }) : [];
+  const everywhere = tf?.model ? onNearlyEveryPage(tf.model, { minPages: 5 }) : [];
+  const notCompared = everywhere.length
+    ? `<p class="meta">${t('Not compared, because they run on nearly every page and leave fewer than 5 pages without them: @list.', { '@list': everywhere.map(esc).join(', ') })}</p>`
+    : '';
+  if (!associations.length) {
+    return emptyCriterionPage(target, summary, { active: 'tech-findings', label: 'Technology ↔ issues', message: 'No finding was at least 1.5 times as common on pages running a technology as on pages without it this week. A technology needs at least 5 pages with it and 5 without it to be compared.', extra: notCompared });
   }
   const model = tf.model;
 
-  // Group the ranked associations by technology, strongest first.
-  const byTech = {};
-  for (const a of tf.associations) (byTech[a.tech] ??= []).push(a);
-  const techOrder = Object.keys(byTech).sort(
-    (a, b) => (byTech[b][0]?.lift ?? 0) - (byTech[a][0]?.lift ?? 0)
-  );
+  // Each finding's full report (pages, elements, fix) is on the Accessibility
+  // page, which renders an anchor for every finding left after exclusions.
+  const bugByFinding = new Map();
+  for (const b of filterBugsByExclusion(bugs, excludePatterns)) {
+    const key = `${b.engine_key === 'axe-core' ? 'axe' : b.engine_key}:${b.rule_id}`;
+    if (b.instance_id && !bugByFinding.has(key)) bugByFinding.set(key, b.instance_id);
+  }
+  const findingCell = (key) => {
+    const id = bugByFinding.get(key);
+    return id ? `<a href="${esc(pageHref('accessibility', id))}">${esc(findingLabel(key))}</a>` : esc(findingLabel(key));
+  };
+  const share = (n, of) => `<td class="num" data-sort="${n / of}">${t('@n of @of (@pct%)', { '@n': nf(n), '@of': nf(of), '@pct': Math.round((100 * n) / of) })}</td>`;
 
-  const sections = techOrder
-    .map((tech) => {
-      const rows = byTech[tech]
-        .map((a) => `<tr>
-  <th scope="row">${esc(findingLabel(a.finding))}</th>
-  <td class="num">${a.lift.toFixed(2)}×</td>
-  <td class="num">${a.pairPages} / ${a.techPages}</td>
-  <td class="num">${a.findingPages}</td>
-</tr>`)
-        .join('\n');
-      return `<h3>${esc(tech)} <span class="bug-meta">${t('@n pages', { '@n': model.tech[tech] })}</span></h3>
+  // Associations come strongest first, so each technology's first is its strongest.
+  const byTech = new Map();
+  for (const a of associations) {
+    if (!byTech.has(a.tech)) byTech.set(a.tech, []);
+    byTech.get(a.tech).push(a);
+  }
+
+  const sections = [...byTech]
+    .map(([tech, rows]) => `<h3>${esc(tech)} <span class="bug-meta">${t('@n pages', { '@n': nf(model.tech[tech]) })}</span></h3>
 <table class="sortable">
-<caption>${t('Findings over-represented on pages running @tech (lift ≥ 1, ≥5 pages support).', { '@tech': esc(tech) })}</caption>
+<caption>${t('Findings at least 1.5 times as common on pages running @tech as on pages without it.', { '@tech': esc(tech) })}</caption>
 <thead><tr>
   <th scope="col">${t('Finding')}</th>
-  <th scope="col" class="num">${t('Lift')}</th>
-  <th scope="col" class="num">${t('On tech pages')}</th>
-  <th scope="col" class="num">${t('On all pages')}</th>
+  <th scope="col" class="num">${t('Pages with @tech', { '@tech': esc(tech) })}</th>
+  <th scope="col" class="num">${t('Pages without it')}</th>
+  <th scope="col" class="num">${t('Times as common')}</th>
 </tr></thead>
-<tbody>${rows}</tbody>
-</table>`;
-    })
+<tbody>${rows.map((a) => `<tr>
+  <th scope="row">${findingCell(a.finding)}</th>
+  ${share(a.pairPages, a.techPages)}
+  ${share(a.withoutFindingPages, a.withoutPages)}
+  <td class="num" data-sort="${a.ratio ?? 1e9}">${a.ratio == null ? t('only with it') : `${a.ratio.toFixed(1)}×`}</td>
+</tr>`).join('\n')}</tbody>
+</table>`)
     .join('\n');
 
   const body = `
 <h1>${esc(target.domain)}: ${t('technology ↔ issues')}</h1>
 ${subnav('tech-findings')}
-<p class="meta">${t('Accessibility findings that appear disproportionately on pages running a given technology, across the @pages page(s) in <strong>@week</strong> where both technology detection and an accessibility engine ran. <strong>Lift</strong> is how many times more likely a finding is on pages with the technology than on pages overall — a value of 2× means twice the baseline rate.', { '@pages': model.pages, '@week': esc(summary.week) })}</p>
-<p class="note">${t('This is an <em>association</em>, not proof of cause. Technologies that are detected on the same set of pages (e.g. a CMS, its host, and its language) will share identical lift values; the listing groups by technology but cannot tell which one in a co-located stack is responsible. Treat high-lift pairs as leads for a human to confirm — a barrier that recurs with the same technology, especially across multiple sites, is likely a bug in that technology rather than in any one page\'s content.')}</p>
+<p class="meta">${t('Accessibility findings that are more common on pages running a technology than on pages without it, across the @pages page(s) in <strong>@week</strong> where both technology detection and an accessibility engine ran. Each finding is compared across the pages its own engine checked, since axe and Alfa can run on different samples.', { '@pages': nf(model.pages), '@week': esc(summary.week) })}</p>
+<p class="meta">${t('<strong>Times as common</strong> compares the two groups: the share of pages with the technology that have the finding, divided by the share of pages without it that have it. 1× means no difference; 2× means twice as common. “Only with it” means no page without the technology had the finding. A finding is listed when it is at least 1.5 times as common and is on at least 5 pages with the technology, and only technologies with at least 5 pages each way are compared.')}</p>
+${notCompared}
+<p class="note">${t('This is an <em>association</em>, not proof of cause. Technologies detected on the same pages (e.g. a CMS, its host, and its language) show the same numbers, and the listing cannot tell which one in such a stack is responsible. Treat strong pairs as leads for a human to confirm — a barrier that recurs with the same technology, especially across multiple sites, is likely a bug in that technology rather than in any one page\'s content.')}</p>
+<p class="meta">${t('Each finding links to its full report on the Accessibility page: the pages it is on, the failing elements and how to fix them.')}</p>
 ${sections}`;
   return layout({
     title: `${target.domain} Tech ↔ Issues ${summary.week} | vital-scans`,
@@ -3478,6 +3521,146 @@ ${detailTable}
     title: `${target.domain} Images ${summary.week} | vital-scans`,
     page: "images",
     breadcrumb: `<li><a href="../../../index.html">${esc(t('All domains'))}</a></li><li><a href="index${localeSuffix()}.html">${esc(target.domain)} ${esc(summary.week)}</a></li><li aria-current="page">${t("Images")}</li>`,
+    body,
+    depth: 3,
+    extraScript: SORT_SCRIPT,
+    apiFinding: { key: target.key, week: summary.week },
+    target,
+  });
+}
+
+const PDF_COLUMNS = [
+  ['tagged', 'Tagged'],
+  ['title', 'Title'],
+  ['language', 'Language'],
+  ['bookmarks', 'Bookmarks'],
+  ['figuresAlt', 'Figure alt text'],
+  ['headings', 'Headings'],
+  ['lists', 'Lists'],
+  ['tables', 'Tables'],
+  ['forms', 'Forms'],
+];
+
+function pdfFileCell(url, title) {
+  let name = url;
+  try {
+    name = decodeURIComponent(new URL(url).pathname.split('/').pop() || url);
+  } catch { /* keep the URL */ }
+  return `<a class="url" href="${esc(url)}" title="${esc(url)}">${esc(name)}</a>${title ? `<br><span class="bug-meta">${esc(title)}</span>` : ''}`;
+}
+
+function pdfVerdictCell(v) {
+  if (v === 'pass') return { html: esc(t('Pass')), sort: 1 };
+  if (v === 'fail') return { html: `<span class="error">${esc(t('Fail'))}</span>`, sort: 0 };
+  return { html: `<span class="bug-meta">${esc(t('n/a'))}</span>`, sort: 2 };
+}
+
+const shortDate = (iso) => (iso ? String(iso).slice(0, 10) : '—');
+
+/**
+ * PDFs page: the site's own PDFs as checked by pdf-crawler in the pdf-audit
+ * workflow (`view` is pdfReportView() from src/lib/pdf-audit.js), modelled on
+ * pdf-crawler's own reports: summary counts, then every check per PDF as
+ * text. `view` is null on older weeks: results are current, not per week.
+ */
+export function renderPdfsPage(target, summary, view, csvHref = null) {
+  const active = { active: 'pdfs', label: 'PDFs' };
+  if (!view) {
+    return emptyCriterionPage(target, summary, { ...active, message: 'PDF check results are on the latest week\'s PDFs page; they describe each PDF as last checked, not as of this week.' });
+  }
+  const howToRun = view.enabled
+    ? t('Up to @n PDF(s) are checked each day, newest first.', { '@n': target.pdfAudit?.perRun ?? 25 })
+    : t('Checks are off for this site. To check its latest 25 PDFs, run <strong>Actions → pdf-audit</strong> with this domain, or set <code>pdf_audit: { enabled: true }</code> in <code>config/targets.yml</code> to check them daily.');
+  const otherNote = view.otherCount
+    ? `<p class="meta">${t('@n linked PDF(s) are on other organisations\' sites and are not checked: @hosts.', { '@n': nf(view.otherCount), '@hosts': view.otherHosts.slice(0, 8).map((h) => `${esc(h.host)} (${nf(h.count)})`).join(', ') + (view.otherHosts.length > 8 ? ', …' : '') })}</p>`
+    : '';
+  if (!view.found) {
+    return emptyCriterionPage(target, summary, { ...active, message: 'No PDF on this site\'s own domain has been found by the scans yet.', extra: otherNote });
+  }
+  if (!view.counts.checked && !view.counts.errors) {
+    return emptyCriterionPage(target, summary, {
+      ...active,
+      message: 'None of this site\'s PDFs has been checked yet.',
+      extra: `<p class="meta">${t('@n PDF(s) on the site\'s own domain are waiting.', { '@n': nf(view.waiting) })} ${howToRun}</p>${otherNote}`,
+    });
+  }
+
+  const ref = view.checker?.ref ? ` (<code>${esc(String(view.checker.ref).slice(0, 7))}</code>)` : '';
+  const dl = csvHref ? ` ${t('Download:')} <a href="${esc(csvHref)}">CSV</a>.` : '';
+  const tiles = `<dl class="ledger">
+${statTile('PDFs found', nf(view.found))}
+${statTile('Checked', nf(view.counts.checked))}
+${statTile('Pass every check', nf(view.counts.accessible))}
+${statTile('Issues found', nf(view.counts.issues))}
+${statTile('Could not check', nf(view.counts.errors))}
+${statTile('Waiting', nf(view.waiting))}
+</dl>`;
+
+  const shown = view.checked.slice(0, 500);
+  const cols = [
+    { label: 'File' },
+    { label: 'Result' },
+    ...PDF_COLUMNS.map(([, label]) => ({ label })),
+    { label: 'Pages', num: true },
+    { label: 'Published' },
+    { label: 'Linked from' },
+    { label: 'Checked' },
+  ];
+  const rows = shown.map((r) => {
+    const failed = PDF_COLUMNS.filter(([k]) => r.report.checks?.[k] === 'fail').length;
+    const result = r.report.accessible
+      ? { html: esc(t('Passes')), sort: 0 }
+      : { html: `<span class="error">${esc(t('Issues found'))}</span>`, sort: 1 + failed };
+    return [
+      { html: pdfFileCell(r.url, r.report.title), sort: r.url },
+      result,
+      ...PDF_COLUMNS.map(([k]) => pdfVerdictCell(r.report.checks?.[k])),
+      { html: r.report.pages != null ? nf(r.report.pages) : '—', sort: r.report.pages ?? 0 },
+      { html: esc(r.report.published ?? '—'), sort: r.report.published ?? '' },
+      { html: r.linkedFrom ? urlCell(r.linkedFrom) : '—', sort: r.linkedFrom ?? '' },
+      { html: esc(shortDate(r.checkedAt)), sort: r.checkedAt ?? '' },
+    ];
+  });
+  // Fifteen columns overflow a narrow screen: the table scrolls inside a
+  // focusable, named region, so it scrolls from the keyboard too.
+  const checkedSection = shown.length ? `<section aria-labelledby="h-pdfs-checked">
+${heading('h-pdfs-checked', t('Checked PDFs'))}
+<div class="table-scroll" role="region" aria-label="${esc(t('Table of checked PDFs'))}" tabindex="0">
+${sortableTable(
+    shown.length < view.checked.length
+      ? t('The @shown of @total checked PDFs with the most failed checks; the CSV has every one.', { '@shown': nf(shown.length), '@total': nf(view.checked.length) })
+      : t('@n checked PDF(s), most failed checks first.', { '@n': nf(shown.length) }),
+    cols,
+    rows,
+  )}
+</div>
+</section>` : '';
+
+  const errorsSection = view.errors.length ? `<section aria-labelledby="h-pdfs-errors">
+${heading('h-pdfs-errors', t('PDFs that could not be checked'))}
+<div class="table-scroll" role="region" aria-label="${esc(t('Table of PDFs that could not be checked'))}" tabindex="0">
+<table>
+<caption>${t('@n PDF(s) and why. Each is tried again in a later week, up to three times.', { '@n': nf(view.errors.length) })}</caption>
+<thead><tr><th scope="col">${t('File')}</th><th scope="col">${t('Reason')}</th><th scope="col">${t('Linked from')}</th><th scope="col" class="num">${t('Attempts')}</th><th scope="col">${t('Last tried')}</th></tr></thead>
+<tbody>${view.errors.slice(0, 500).map((e) => `<tr><th scope="row">${pdfFileCell(e.url)}</th><td>${esc(e.error)}</td><td>${e.linkedFrom ? urlCell(e.linkedFrom) : '—'}</td><td class="num">${nf(e.attempts)}</td><td>${esc(shortDate(e.checkedAt))}</td></tr>`).join('\n')}</tbody>
+</table>
+</div>
+</section>` : '';
+
+  const body = `
+<h1>${esc(target.domain)}: ${t('PDFs')}</h1>
+${subnav('pdfs')}
+<p class="meta">${t('PDFs linked from this site\'s pages and hosted on its own domain, checked with <a href="https://github.com/mgifford/pdf-crawler">pdf-crawler</a>@ref: tagging, title, language, bookmarks, figure alt text, headings, lists, tables and forms.', { '@ref': ref })}${dl}</p>
+<p class="note">${t('Automated checks find some problems, not all. A PDF that passes them still needs a person to check it, for example with a screen reader. "n/a" means the PDF has nothing that check applies to.')}</p>
+${tiles}
+<p class="meta">${view.waiting ? `${t('@n PDF(s) are waiting for a check.', { '@n': nf(view.waiting) })} ` : ''}${howToRun}</p>
+${otherNote}
+${checkedSection}
+${errorsSection}`;
+  return layout({
+    title: `${target.domain} PDFs ${summary.week} | vital-scans`,
+    page: 'pdfs',
+    breadcrumb: `<li><a href="../../../index.html">${esc(t('All domains'))}</a></li><li><a href="index${localeSuffix()}.html">${esc(target.domain)} ${esc(summary.week)}</a></li><li aria-current="page">${t('PDFs')}</li>`,
     body,
     depth: 3,
     extraScript: SORT_SCRIPT,
@@ -3708,6 +3891,7 @@ ${coverageTable(summary)}`;
   const body = `
 <h1>${esc(target.domain)}: ${t('week @week', { '@week': esc(summary.week) })}</h1>
 ${subnav('overview')}
+${accessBanner(summary.access, target.user_agent)}
 <p class="meta">${t('This is the <strong>@week</strong> ISO-week report (<strong>@fetched</strong> pages fetched, <strong>@audited</strong> unique pages audited by axe/Alfa). Generated @date.', { '@week': esc(summary.week), '@fetched': summary.pagesScanned, '@audited': summary.pagesAudited ?? summary.pagesScanned, '@date': esc(summary.generatedAt.slice(0, 10)) })}
 ${prev ? t('Compared against @week (@n fetched).', { '@week': esc(prev.week), '@n': prev.pagesScanned }) : t('First recorded week; no comparison yet.')} ${t('The dashboard headline uses a rolling last-7-days window; this page is the full ISO week.')}
 ${t('Machine-readable API:')} <a href="../../../api/v1/${esc(target.key)}/snapshot.json">snapshot.json</a> · <a href="../../../api/v1/${esc(target.key)}/${esc(summary.week)}/findings.json">findings.json</a>.</p>
@@ -3841,6 +4025,7 @@ export function renderAccessibilityPage(target, summary, bugs, csvLinks, reporti
   const body = `
 <h1>${esc(target.domain)}: ${t('Accessibility')} — ${t('week @week', { '@week': esc(summary.week) })}</h1>
 ${subnav('accessibility')}
+${accessBanner(summary.access, target.user_agent)}
 ${acrNote}
 ${renderTrainingPriorities(trainingPriorities, trainingAdvice)}
 ${nextActionsSection(summary, bugs, reporting)}
@@ -4055,33 +4240,142 @@ ${table}
 </figure>`;
 }
 
-export function renderIndex(dashboard, { branding = {} } = {}) {
+const WAF_ALLOWLIST_URL = 'https://github.com/mgifford/vital-core/blob/main/WAF-ALLOWLIST.md';
+
+function statusList(statuses) {
+  return Object.entries(statuses ?? {}).sort((a, b) => b[1] - a[1]).map(([s, n]) => `HTTP ${s} × ${n}`).join(', ');
+}
+
+/**
+ * Why a site blocks the scanner, as list items, plus what to ask the site
+ * for. Every cause is a text label, never colour alone.
+ */
+export function accessReasons(access, userAgent = 'vital-scans') {
+  const items = [];
+  const actions = [];
+  const labels = [];
+  const ua = esc(String(userAgent).split('/')[0] || 'vital-scans');
+  const fw = access?.firewall;
+  if (fw?.pages) {
+    const by = fw.by?.length ? ` ${t('Identified as @firewalls.', { '@firewalls': esc(fw.by.join(', ')) })}` : '';
+    labels.push(t('blocked by a firewall'));
+    items.push(`<strong>${t('Blocked by a firewall')}</strong>: ${t('@count page(s) got a challenge or refusal instead of the page (@statuses).', { '@count': fw.pages, '@statuses': esc(statusList(fw.statuses)) })}${by}`);
+    actions.push(t('Ask the site’s web team to let the user agent <code>@ua</code> through its firewall (<a href="@href">what to send them</a>).', { '@ua': ua, '@href': WAF_ALLOWLIST_URL }));
+  }
+  const rb = access?.robots;
+  if (rb?.rootBlocked || rb?.skipped) {
+    labels.push(t('blocked by robots.txt'));
+    items.push(`<strong>${t('Blocked by robots.txt')}</strong>: ${rb.rootBlocked
+      ? t('robots.txt disallows the scanner for the whole site.')
+      : t('@count page(s) skipped because robots.txt disallows them for the scanner.', { '@count': rb.skipped })}`);
+    actions.push(t('Ask the site to allow <code>@ua</code> in its robots.txt.', { '@ua': ua }));
+  }
+  if (access?.connection) {
+    labels.push(t('unreachable'));
+    items.push(`<strong>${t('Unreachable')}</strong>: ${t('no page loaded in @runs run(s)', { '@runs': access.connection.runs })}${access.connection.error ? ` (${esc(access.connection.error.replace(/\.$/, ''))})` : ''}.`);
+    actions.push(t('Run Actions → diagnose for this domain to see what the scanner’s network gets. A network block has to be lifted by the site’s team.'));
+  }
+  if (access?.level === 'blocked' && Object.keys(access.errorStatuses ?? {}).length) {
+    items.push(t('Other pages answered with an error: @statuses.', { '@statuses': esc(statusList(access.errorStatuses)) }));
+  }
+  return { items, actions, labels };
+}
+
+/**
+ * Dashboard alert for every configured site the scanner couldn't fully
+ * scan: blocked, partly blocked or unreachable first, then sites with no
+ * scan data yet. Placed above the ranking, not collapsed, because a missing
+ * or partial result is the first thing a reader needs to know.
+ */
+export function accessAlert(entries) {
+  const stopped = entries.filter((e) => ['blocked', 'partial'].includes(e.access?.level));
+  const waiting = entries.filter((e) => e.access?.level === 'not-scanned');
+  if (!stopped.length && !waiting.length) return '';
+  const label = (level) => (level === 'partial' ? t('Partly blocked') : t('Blocked'));
+  const names = (list) => {
+    const shown = list.slice(0, 3).map((e) => esc(e.domain)).join(', ');
+    return list.length > 3 ? `${shown} ${t('and @count more', { '@count': list.length - 3 })}` : shown;
+  };
+  const list = stopped.map((e) => {
+    const { items, actions } = accessReasons(e.access, e.userAgent);
+    const name = e.href ? `<a href="${esc(e.href)}">${esc(e.domain)}</a>` : esc(e.domain);
+    return `<li><strong>${name}</strong>: ${label(e.access.level)}.
+<ul>${items.map((i) => `<li>${i}</li>`).join('')}</ul>
+${actions.length ? `<p>${actions.join(' ')}</p>` : ''}</li>`;
+  }).join('\n');
+  const notYet = waiting.length
+    ? `<p>${t('Not scanned yet: @domains. No scan has saved any data for them.', { '@domains': waiting.map((e) => esc(e.domain)).join(', ') })}</p>`
+    : '';
+  const summary = stopped.length
+    ? t('Sites blocking the scanner (@count): @domains', { '@count': stopped.length, '@domains': names(stopped) })
+    : t('Sites not scanned yet (@count): @domains', { '@count': waiting.length, '@domains': names(waiting) });
+  // The summary names the count and the sites, so the notice reads at a
+  // glance while closed. No heading inside <summary>: its button role hides
+  // headings from some screen readers, so the region is labelled instead.
+  return `<section class="access-notice" aria-labelledby="h-access">
+<details>
+<summary><span id="h-access">${summary}</span></summary>
+${stopped.length ? `<p>${t('A firewall rule, a robots.txt rule or a network block stopped the scanner on these sites, so their results are missing or partial. The fix is on the site’s side.')}</p>
+<ul>${list}</ul>` : ''}
+${notYet}
+</details>
+</section>`;
+}
+
+/**
+ * Notice at the top of a domain's pages when the scanner was blocked. Open
+ * when nothing could be audited, since it is then the page's whole story;
+ * closed when only part of the site was blocked.
+ */
+export function accessBanner(access, userAgent) {
+  if (!['blocked', 'partial'].includes(access?.level)) return '';
+  const { items, actions, labels } = accessReasons(access, userAgent);
+  const title = access.level === 'partial'
+    ? t('Part of this site blocks the scanner')
+    : t('This site blocks the scanner');
+  const scope = access.level === 'partial'
+    ? t('The results below cover only the pages the scanner could reach.')
+    : t('No page could be audited, so there are no accessibility results for this site.');
+  return `<section class="access-notice" aria-labelledby="h-access-banner">
+<details${access.level === 'blocked' ? ' open' : ''}>
+<summary><span id="h-access-banner">${title}${labels.length ? `: ${labels.join(', ')}` : ''}</span></summary>
+<p>${scope}</p>
+<ul>${items.map((i) => `<li>${i}</li>`).join('')}</ul>
+${actions.length ? `<p>${actions.join(' ')}</p>` : ''}
+</details>
+</section>`;
+}
+
+export function renderIndex(dashboard, { branding = {}, unscanned = [] } = {}) {
   // Profile branding overrides the default headline/intro; absent (the
   // GitHub Pages default) it falls back to the original copy unchanged.
   const h1 = branding.title || t('Weekly quality ledger');
   const intro = branding.intro
     || t('Accessibility and sustainability, measured continuously with open source engines. Thousands of pages per domain, scanned slowly and politely across each week.');
   const pageTitle = branding.title ? `${branding.title} | vital-scans` : 'vital-scans | weekly quality ledger';
-  // Separate targets whose latest week is blocked (e.g. a WAF returning
-  // 403 to the scanner) so they don't read as zero-violation successes.
-  const blocked = dashboard.filter(({ series }) => series[series.length - 1].blocked);
-  const active = dashboard.filter(({ series }) => !series[series.length - 1].blocked);
-
-  // Blocked targets are useful context but not the headline — collapsed
-  // into an accordion at the bottom of the dashboard, not up top.
-  const blockedCallout = blocked.length === 0 ? '' : `
-<section aria-labelledby="h-blocked">
-<details class="blocked-accordion">
-<summary><span id="h-blocked">${t('Blocked targets (@n)', { '@n': blocked.length })}</span></summary>
-<p>${t('These sites returned only access-denied responses to the scanner, so no accessibility or sustainability data could be collected. This is typically a WAF or bot manager blocking automated traffic, not a scan failure. See <a href="https://github.com/mgifford/vital-core/blob/main/WAF-ALLOWLIST.md">WAF-ALLOWLIST.md</a> for how the scanner can be allowlisted.')}</p>
-<ul>${blocked
-    .map(({ target, series }) => {
+  // A target whose latest week audited nothing (a firewall, robots.txt or
+  // network block) is listed in the access alert instead of the ranking, so
+  // it can't read as a zero-violation success.
+  const isBlocked = (latest) => latest.access?.level === 'blocked' || (!latest.access && latest.blocked);
+  const blocked = dashboard.filter(({ series }) => isBlocked(series[series.length - 1]));
+  const active = dashboard.filter(({ series }) => !isBlocked(series[series.length - 1]));
+  const reportHref = (target, latest) => `reports/${target.key}/${latest.week}/index.html`;
+  // A pruned week's committed summary may predate `access`; its `blocked`
+  // status still says whether a firewall refused the scanner.
+  const legacyAccess = (latest) => {
+    const n = latest.pagesScanned ?? 1;
+    const statuses = { [latest.blocked.status]: n };
+    return [401, 403, 429].includes(latest.blocked.status)
+      ? { level: 'blocked', firewall: { pages: n, statuses, by: [] }, errorStatuses: {} }
+      : { level: 'blocked', firewall: { pages: 0 }, errorStatuses: statuses };
+  };
+  const accessSection = accessAlert([
+    ...dashboard.map(({ target, series }) => {
       const latest = series[series.length - 1];
-      return `<li><strong>${esc(target.domain)}</strong> — ${t('HTTP @status (@week)', { '@status': latest.blocked.status, '@week': esc(latest.week) })}</li>`;
-    })
-    .join('\n')}</ul>
-</details>
-</section>`;
+      return { domain: target.domain, href: reportHref(target, latest), userAgent: target.user_agent, access: latest.access ?? (latest.blocked ? legacyAccess(latest) : null) };
+    }),
+    ...unscanned.map(({ target, access }) => ({ domain: target.domain, userAgent: target.user_agent, access })),
+  ]);
 
   // Leaderboard: rank domains best->worst by score (computed over the
   // trailing-7-day window so it's a fair, like-for-like benchmark), with
@@ -4103,8 +4397,9 @@ export function renderIndex(dashboard, { branding = {} } = {}) {
     .map((d) => {
       const { target, series, latest, win, score, traj } = d;
       const trend = series.map(medAxe);
+      const partly = latest.access?.level === 'partial' ? ` <strong class="access-flag">${t('Partly blocked')}</strong>` : '';
       return `<tr>
-  <th scope="row"><a href="reports/${esc(target.key)}/${esc(latest.week)}/index.html">${esc(target.domain)}</a></th>
+  <th scope="row"><a href="reports/${esc(target.key)}/${esc(latest.week)}/index.html">${esc(target.domain)}</a>${partly}</th>
   <td class="num">${fmtA11yGrade(score, target.display?.score_format ?? 'both')}</td>
   <td>${arrow(traj)}</td>
   <td class="num">${win.pagesAudited ?? win.pagesScanned}</td>
@@ -4275,10 +4570,11 @@ ${heading('h-patterns', t('Recurring patterns across domains'))}
   const body = `
 <h1>${esc(h1)}</h1>
 <p class="meta">${esc(intro)}</p>
+${accessSection}
 ${active.length === 0
-    ? (dashboard.length === 0
+    ? (dashboard.length === 0 && !unscanned.some((u) => u.access?.level === 'blocked')
         ? `<p>${t('No scan data yet. The first weekly report appears after the first scheduled scans complete.')}</p>`
-        : `<p>${t('No accessibility or sustainability data could be collected yet — every target is currently blocked (see the bottom of this page).')}</p>`)
+        : `<p>${t('No accessibility or sustainability data could be collected yet: every target is blocked (see above).')}</p>`)
     : `
 <table>
 <caption>${t('Domains ranked by accessibility score (best first). Trajectory compares the score against ~4 weeks ago. Counts are medians per page over the last 7 days, comparable across sites of any size.')}</caption>
@@ -4291,8 +4587,7 @@ ${sustainTrend}
 ${worstSection}
 ${techFindingsSection}
 ${lighthouseFleetSection}
-${patternsSection}
-${blockedCallout}`}
+${patternsSection}`}
 <section aria-labelledby="h-tools">
 ${heading('h-tools', t('Tools'))}
 <ul>
@@ -4435,9 +4730,16 @@ export function renderUrlLookup(domains) {
   }
 
   // ── Search ────────────────────────────────────────────────────────
+  // Mirrors urlMatchKey() in src/lib/urls.js: a page is found however its
+  // address is written (http or https, apex or www., with a fragment or a
+  // trailing slash), since stored URLs keep whatever form was scanned.
+  function matchKey(s) {
+    return String(s).toLowerCase().trim().replace(/^[a-z][a-z0-9+.-]*:\\/\\//, '').replace(/^www\\./, '').replace(/#.*$/, '');
+  }
+
   form.addEventListener('submit', function (e) {
     e.preventDefault();
-    var q = input.value.toLowerCase().trim();
+    var q = matchKey(input.value).replace(/(.)\\/$/, '$1');
     if (!q) return;
 
     var keys = selectedKeys();
@@ -4455,12 +4757,12 @@ export function renderUrlLookup(domains) {
         indexes.forEach(function (idx) {
           if (!idx) return;
           idx.pages.forEach(function (p) {
-            if (p.url.toLowerCase().includes(q)) {
+            if (matchKey(p.url).includes(q)) {
               results.push(Object.assign({}, p, { domain: idx.domain, week: idx.week }));
             }
           });
         });
-        showResults(results, q);
+        showResults(results, input.value.trim());
       });
   });
 
@@ -4744,10 +5046,11 @@ td .url, th .url { max-width: 22rem; }
 .sort-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .meta, .note { color: var(--muted); }
 .note { border-left: 4px solid var(--rule); padding-left: .75rem; }
-.callout-blocked { border-left: 4px solid var(--worse); padding: .25rem 1rem;
-  background: color-mix(in srgb, var(--worse) 8%, transparent); border-radius: 2px; }
-.callout-blocked h2 { color: var(--worse); border-bottom: none; margin-top: .75rem; }
-.callout-blocked ul { margin: .5rem 0; }
+.access-notice { border-left: 4px solid var(--worse); padding: .35rem .75rem; margin: 1rem 0; }
+.access-notice summary { cursor: pointer; font-weight: 600; }
+.access-notice summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.access-notice ul { margin: .5rem 0; }
+.access-flag { color: var(--worse); font-size: .85rem; white-space: nowrap; }
 .callout-win { border-left: 4px solid var(--better); padding: .25rem 1rem; margin: 1rem 0;
   background: color-mix(in srgb, var(--better) 8%, transparent); border-radius: 2px; }
 .callout-win h2 { color: var(--better); border-bottom: none; margin-top: .75rem; }
@@ -4768,8 +5071,6 @@ td .url, th .url { max-width: 22rem; }
 .fixed-list li { margin: .15rem 0; }
 .fixed-list-unconfirmed { color: var(--muted); }
 .pattern-id { font-family: ui-monospace, monospace; font-size: .8rem; }
-.blocked-accordion { margin-top: 2rem; border-top: 1px solid var(--rule); padding-top: .5rem; }
-.blocked-accordion > summary { cursor: pointer; color: var(--muted); font-weight: 600; }
 .ledger { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
   gap: .75rem 2rem; margin: 1rem 0; }
 .ledger div { border-top: 1px solid var(--rule); padding-top: .4rem; }
@@ -4781,6 +5082,8 @@ td .url, th .url { max-width: 22rem; }
 .delta.better { color: var(--better); }
 .delta.same { color: var(--muted); }
 table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .95rem; }
+.table-scroll { overflow-x: auto; }
+.table-scroll:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
 caption { text-align: left; color: var(--muted); font-size: .85rem; padding-bottom: .4rem; }
 th, td { text-align: left; padding: .45rem .6rem; border-bottom: 1px solid var(--rule);
   vertical-align: top; }
@@ -4859,7 +5162,7 @@ footer { margin-top: 3rem; border-top: 3px double var(--rule); padding-top: 1rem
   margin: .6rem 0; padding: 0 .9rem; }
 .bug > summary { cursor: pointer; padding: .6rem 0; font-weight: 600; scroll-margin-top: 2rem; }
 .bug[open] > summary { border-bottom: 1px solid var(--rule); margin-bottom: .6rem; }
-.bug > summary.target-bug { outline: 4px solid var(--accent); outline-offset: 2px; }
+.bug > summary.target-bug, .overflow-findings tr.target-bug { outline: 4px solid var(--accent); outline-offset: 2px; }
 .bug-permalink { opacity: 0; text-decoration: none; color: var(--accent); font-weight: 700;
   padding: 0 .2rem; margin-right: .1rem; border-radius: 2px; }
 .bug > summary:hover .bug-permalink, .bug-permalink:focus { opacity: 1; }

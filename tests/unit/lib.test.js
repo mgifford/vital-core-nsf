@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { normalizeUrl, pageId, registrableDomain, isThirdParty } from '../../src/lib/urls.js';
 import { isoWeekOf, previousWeekOf } from '../../src/lib/week.js';
 import { parseRobots } from '../../src/lib/robots.js';
@@ -12,16 +13,16 @@ import { splitSentences, estimateSyllables } from '../../src/engines/plain-langu
 import { checkLink } from '../../src/lib/links.js';
 import { normalizeRate, shouldRun } from '../../src/lib/sampling.js';
 import { updateFindings } from '../../src/lib/findings.js';
-import { findMisspellings } from '../../src/lib/spell.js';
+import { findMisspellings, loadSpeller } from '../../src/lib/spell.js';
 import { impactFor, estimateExcluded, pct } from '../../src/lib/fpc.js';
 import { toCsv, ruleSlug, writeLighthouseCsv, writeLighthouseJson } from '../../src/lib/csv.js';
 import { updateResourceLedger } from '../../src/lib/resource-ledger.js';
 import { buildAcrData, buildAcrYaml, renderAcrHtml } from '../../src/lib/acr.js';
 import { headersToWappalyzer } from '../../src/engines/tech.js';
-import { buildCooccurrence, lift, rankAssociations, mergeFleet, rankFleetAssociations } from '../../src/lib/tech-findings.js';
+import { buildCooccurrence, lift, rankAssociations, onNearlyEveryPage, mergeFleet, rankFleetAssociations } from '../../src/lib/tech-findings.js';
 import { rollupThirdParty } from '../../src/lib/third-party-rollup.js';
 import { buildLineManifest } from '../../src/lib/paracharts.js';
-import { extractAudits } from '../../src/engines/lighthouse.js';
+import { extractAudits, isDetachedTargetError, isClosedSessionError } from '../../src/engines/lighthouse.js';
 import { assessAltText, isAltProblem, ALT_VERDICTS } from '../../src/lib/alt-text.js';
 import { loadPriorityUrls } from '../../src/lib/top-tasks.js';
 import { prioritizeAccessibilityBugs } from '../../src/lib/accessibility-priority.js';
@@ -151,10 +152,22 @@ test('pickBatch: never-scanned first, weekly cap respected, no rescan same week'
   const { batch: capped } = pickBatch(state, '2026-W24', 10, 2);
   assert.equal(capped.length, 1);
 
-  // Failing pages excluded after 3 failures.
+  // Failing pages excluded after 3 failures in the same week.
   state.pages.c.failCount = 3;
+  state.pages.c.lastFailedWeek = '2026-W24';
   const { batch: noFail } = pickBatch(state, '2026-W24', 10, 100);
   assert.deepEqual(noFail.map((b) => b.id), ['b']);
+});
+
+test('pickBatch: a page that failed out in an earlier week is tried again', () => {
+  const state = { domain: 'x', pages: {} };
+  addPage(state, 'home', 'https://x/', 0);
+  state.pages.home.failCount = 3;
+  state.pages.home.lastFailedWeek = '2026-W44';
+  assert.deepEqual(pickBatch(state, '2026-W44', 10, 100).batch.map((b) => b.id), [], 'not again the same week');
+  assert.deepEqual(pickBatch(state, '2026-W45', 10, 100).batch.map((b) => b.id), ['home'], 'tried once more the next week');
+  delete state.pages.home.lastFailedWeek;
+  assert.deepEqual(pickBatch(state, '2026-W44', 10, 100).batch.map((b) => b.id), ['home'], 'an entry from before lastFailedWeek gets one more try');
 });
 
 test('pickBatch: priority URLs scanned first, no rescan within a week', () => {
@@ -197,8 +210,9 @@ test('pickBatch: failed pages can retry in-week until fail threshold', () => {
   state.pages.done.lastScannedWeek = '2026-W24';
   // retry: no completed outcome yet this week and below fail threshold -> eligible.
   state.pages.retry.failCount = 2;
-  // blocked: reached fail threshold -> excluded.
+  // blocked: reached fail threshold this week -> excluded.
   state.pages.blocked.failCount = 3;
+  state.pages.blocked.lastFailedWeek = '2026-W24';
 
   const { batch } = pickBatch(state, '2026-W24', 10, 100);
   assert.deepEqual(batch.map((b) => b.id), ['retry']);
@@ -232,6 +246,7 @@ test('budgetStatus: cap reached vs frontier empty vs runnable', () => {
   addPage(empty, 'b', 'https://x/b', 0);
   empty.pages.a.lastScannedWeek = '2026-W24';
   empty.pages.b.failCount = 3;
+  empty.pages.b.lastFailedWeek = '2026-W24';
   const emptyStatus = budgetStatus(empty, '2026-W24', target);
   assert.equal(emptyStatus.remaining, 2);
   assert.equal(emptyStatus.frontierEmpty, true);
@@ -472,6 +487,24 @@ test('spell: flags real misspellings, skips numbers/acronyms/allowlist/jargon', 
   ]);
   assert.equal(r.misspelledCount, 3);
   assert.deepEqual(r.misspelled.sort(), ['recieve', 'teh', 'xyzzy']);
+});
+
+test('spell: each spelling_locale accepts its own English and still catches typos', async () => {
+  const words = ['organisation', 'colour', 'centre', 'programme', 'organization', 'accesibility', 'Medicaid'];
+  const flagged = async (locale) => {
+    await loadSpeller(locale);
+    return findMisspellings(words, 25, [], locale).misspelled.sort();
+  };
+  assert.deepEqual(findMisspellings(words).misspelled.sort(), ['accesibility', 'centre', 'colour', 'organisation', 'programme'], 'the default is US English');
+  assert.deepEqual(await flagged('en-GB'), ['accesibility', 'organization']);
+  assert.deepEqual(await flagged('en-CA'), ['accesibility', 'organisation', 'programme']);
+  assert.deepEqual(await flagged('en-AU'), ['accesibility', 'organization', 'programme']);
+  assert.ok(!(await flagged('en-GB')).includes('Medicaid'), 'the project allowlist applies to every locale');
+});
+
+test('spell: a locale must be loaded before use, and unknown locales are refused', async () => {
+  assert.throws(() => findMisspellings(['word'], 25, [], 'en-NZ'), /not loaded/);
+  await assert.rejects(loadSpeller('en-NZ'), /Unsupported spelling locale "en-NZ"/);
 });
 
 test('spell: per-call extraAllowlist suppresses target-specific jargon', () => {
@@ -921,6 +954,95 @@ test('security: classifies TLD, HTTPS, and headers from a mocked origin', async 
     assert.equal(by2['https'], false, 'http is not https');
     assert.equal(by2['gov-tld'], false, '.com is not sponsored');
     assert.equal(by2['security-txt'], false);
+
+    const r3 = await runSecurity('https://www.hackney.gov.uk', 'ua', 1000);
+    const gov3 = r3.checks.find((c) => c.id === 'gov-tld');
+    assert.equal(gov3.pass, true, 'a .gov.uk council is on a government domain');
+    assert.equal(gov3.detail, 'gov.uk (United Kingdom)');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('governmentSuffix: national government namespaces count, look-alikes do not', async () => {
+  const { governmentSuffix } = await import('../../src/engines/security.js');
+  assert.equal(governmentSuffix('www.cms.gov'), '.gov');
+  assert.equal(governmentSuffix('go.walsall.gov.uk'), '.gov.uk');
+  assert.equal(governmentSuffix('WWW.GOV.SCOT.'), '.gov.scot', 'case and a trailing dot are ignored');
+  assert.equal(governmentSuffix('www.canada.ca'), '.canada.ca');
+  assert.equal(governmentSuffix('canada.ca'), '.canada.ca', 'the apex itself counts');
+  assert.equal(governmentSuffix('www.tbs-sct.gc.ca'), '.gc.ca');
+  assert.equal(governmentSuffix('www.digital.go.jp'), '.go.jp');
+  assert.equal(governmentSuffix('example.com'), null);
+  assert.equal(governmentSuffix('notgov.uk'), null);
+  assert.equal(governmentSuffix('www.example.co.uk'), null);
+  assert.equal(governmentSuffix('gov.uk.example.com'), null, 'only the end of the host counts');
+  assert.equal(governmentSuffix(''), null);
+  assert.equal(governmentSuffix('www.sat.gob.mx', [{ suffix: '.gob.mx', country: 'Mexico' }]), '.gob.mx', 'a fleet can add its own');
+});
+
+test('governmentDomainCheck: names the country, or the domain that is not listed', async () => {
+  const { governmentDomainCheck } = await import('../../src/engines/security.js');
+  assert.deepEqual(governmentDomainCheck('go.walsall.gov.uk'), { id: 'gov-tld', label: 'Government domain', pass: true, detail: 'gov.uk (United Kingdom)' });
+  assert.equal(governmentDomainCheck('www.cms.gov').detail, 'gov (United States)');
+  assert.equal(governmentDomainCheck('www.tbs-sct.gc.ca').detail, 'gc.ca (Canada)');
+  assert.equal(governmentDomainCheck('www.sat.gob.mx', [{ suffix: '.gob.mx', country: 'Mexico' }]).detail, 'gob.mx (Mexico)');
+  assert.deepEqual(governmentDomainCheck('www.example.co.uk'), { id: 'gov-tld', label: 'Government domain', pass: false, detail: 'example.co.uk is not a listed government domain' });
+});
+
+test('withCurrentGovernmentCheck: a stored result gets today\'s answer, other checks untouched', async () => {
+  const { withCurrentGovernmentCheck } = await import('../../src/engines/security.js');
+  const stored = { checks: [{ id: 'https', label: 'Served over HTTPS', pass: true }, { id: 'gov-tld', label: 'Sponsored government TLD (.gov/.mil/.edu)', pass: false, detail: 'uk' }], passed: 1, total: 2 };
+  const r = withCurrentGovernmentCheck(stored, 'go.walsall.gov.uk');
+  assert.deepEqual(r.checks[1], { id: 'gov-tld', label: 'Government domain', pass: true, detail: 'gov.uk (United Kingdom)' });
+  assert.equal(r.checks[0], stored.checks[0]);
+  assert.equal(r.passed, 2);
+  assert.equal(r.total, 2);
+  assert.equal(stored.checks[1].pass, false, 'the stored result is not changed');
+  const none = { checks: [{ id: 'https', pass: true }], passed: 1, total: 1 };
+  assert.equal(withCurrentGovernmentCheck(none, 'go.walsall.gov.uk'), none);
+  assert.equal(withCurrentGovernmentCheck(null, 'go.walsall.gov.uk'), null);
+});
+
+test('wwwVariants: the registrable domain with and without www, not www. on a subdomain', async () => {
+  const { wwwVariants } = await import('../../src/engines/security.js');
+  assert.deepEqual(wwwVariants('go.walsall.gov.uk'), ['walsall.gov.uk', 'www.walsall.gov.uk']);
+  assert.deepEqual(wwwVariants('www.cms.gov'), ['cms.gov']);
+  assert.deepEqual(wwwVariants('blackburn.gov.uk'), ['www.blackburn.gov.uk']);
+  assert.deepEqual(wwwVariants('www.canada.ca'), ['canada.ca']);
+  assert.deepEqual(wwwVariants('www.gov.uk'), ['gov.uk'], 'GOV.UK itself sits on a public suffix');
+  assert.deepEqual(wwwVariants('localhost'), []);
+  assert.deepEqual(wwwVariants('127.0.0.1'), []);
+});
+
+test('security: www resolution checks walsall.gov.uk and www.walsall.gov.uk for go.walsall.gov.uk', async () => {
+  const { runSecurity } = await import('../../src/engines/security.js');
+  const realFetch = globalThis.fetch;
+  const asked = [];
+  try {
+    globalThis.fetch = async (u) => {
+      asked.push(u);
+      if (u === 'https://walsall.gov.uk/') return { ok: true, status: 200, url: 'https://go.walsall.gov.uk/', headers: new Map() };
+      if (u === 'https://www.walsall.gov.uk/') return { ok: false, status: 404, url: u, headers: new Map() };
+      return { ok: true, status: 200, url: u, headers: new Map() };
+    };
+    const r = await runSecurity('https://go.walsall.gov.uk', 'ua', 1000);
+    const www = r.checks.find((c) => c.id === 'www-resolution');
+    assert.ok(!asked.includes('https://www.go.walsall.gov.uk/'), 'www. on the subdomain is not what a visitor types');
+    assert.equal(www.pass, false);
+    assert.equal(www.detail, 'walsall.gov.uk redirects to go.walsall.gov.uk; www.walsall.gov.uk answers HTTP 404');
+
+    globalThis.fetch = async (u) => {
+      if (u === 'https://www.walsall.gov.uk/') throw new Error('ENOTFOUND');
+      return { ok: true, status: 200, url: u === 'https://walsall.gov.uk/' ? 'https://go.walsall.gov.uk/' : u, headers: new Map() };
+    };
+    assert.match((await runSecurity('https://go.walsall.gov.uk', 'ua', 1000)).checks.find((c) => c.id === 'www-resolution').detail, /www\.walsall\.gov\.uk does not answer$/);
+
+    globalThis.fetch = async (u) => ({ ok: true, status: 200, url: u === 'https://cms.gov/' ? 'https://www.cms.gov/' : u, headers: new Map() });
+    const cms = (await runSecurity('https://www.cms.gov', 'ua', 1000)).checks.find((c) => c.id === 'www-resolution');
+    assert.deepEqual([cms.pass, cms.detail], [true, 'cms.gov redirects to www.cms.gov']);
+
+    assert.ok(!(await runSecurity('http://127.0.0.1:9', 'ua', 1000)).checks.some((c) => c.id === 'www-resolution'), 'an IP address has no www form to check');
   } finally {
     globalThis.fetch = realFetch;
   }
@@ -994,7 +1116,7 @@ test('perf-impact: averages always; totals only with page loads', async () => {
   assert.equal(humanBytes(2.5e12), '2.5 TB');
 });
 
-test('dashboard: blocked targets render in a collapsed accordion, not up top', async () => {
+test('dashboard: blocked targets are listed above the ranking, and still not ranked', async () => {
   const { renderIndex } = await import('../../src/report-html.js');
   const wk = (week, blocked) => ({ week, blocked, pagesScanned: 1, pagesAudited: blocked ? 0 : 1,
     axe: { medianViolations: 0, pagesWithViolations: 0, pagesScanned: 1 },
@@ -1004,10 +1126,11 @@ test('dashboard: blocked targets render in a collapsed accordion, not up top', a
     { target: { domain: 'blocked.gov', key: 'blocked.gov' }, series: [wk('2026-W25', { status: 403 })], diffs: {}, bugs: [] },
   ];
   const html = renderIndex(dashboard);
-  assert.match(html, /<details class="blocked-accordion">/, 'blocked targets are in a <details> accordion');
-  assert.match(html, /Blocked targets \(1\)/, 'accordion summary shows the count');
-  // The blocked accordion comes AFTER the leaderboard table, not before it.
-  assert.ok(html.indexOf('<table') < html.indexOf('blocked-accordion'), 'accordion is below the main content');
+  assert.match(html, /Sites blocking the scanner \(1\)/, 'the alert shows the count');
+  assert.match(html, /blocked\.gov<\/a><\/strong>: Blocked\./, 'a summary from before access was recorded still lists the site');
+  assert.match(html, /HTTP 403 × 1/, 'with its error status');
+  assert.ok(html.indexOf('id="h-access"') < html.indexOf('<table'), 'the alert comes before the ranking');
+  assert.doesNotMatch(html.slice(html.indexOf('<table')), /<th scope="row"><a[^>]*>blocked\.gov/, 'the blocked site is not ranked');
 });
 
 test('buildUrlFilter: no config passes everything', () => {
@@ -1486,16 +1609,52 @@ test('tech-findings: lift over- and under-representation, support guard', () => 
   assert.equal(lift(m, 'GTM', 'axe:missing', 1), null);
 });
 
-test('tech-findings: rankAssociations sorts by lift then support', () => {
+test('tech-findings: rankAssociations compares pages with and without the tech, strongest first', () => {
   const pages = [];
   for (let i = 0; i < 6; i++) pages.push({ techs: ['A'], findings: ['axe:x'] });
-  for (let i = 0; i < 6; i++) pages.push({ techs: ['B'], findings: i < 3 ? ['axe:x'] : [] });
+  for (let i = 0; i < 6; i++) pages.push({ techs: ['B'], findings: i < 3 ? ['axe:x', 'axe:y'] : ['axe:y'] });
+  for (let i = 0; i < 6; i++) pages.push({ techs: [], findings: i < 3 ? ['axe:y'] : [] });
   const m = buildCooccurrence(pages);
   const ranked = rankAssociations(m, { minPages: 3 });
-  assert.ok(ranked.length >= 1);
-  // A (finding on all 6) has higher lift than B (finding on 3 of 6).
-  assert.equal(ranked[0].tech, 'A');
-  assert.ok(ranked[0].lift >= (ranked[1]?.lift ?? 0));
+  assert.deepEqual(ranked[0], { tech: 'A', finding: 'axe:x', ratio: 4, lift: 2, pairPages: 6, techPages: 6, findingPages: 9, withoutPages: 12, withoutFindingPages: 3 },
+    'x on 6 of 6 A pages (100%) against 3 of 12 others (25%)');
+  const y = ranked.find((a) => a.tech === 'B' && a.finding === 'axe:y');
+  assert.equal(y.ratio, 4, 'y on 6 of 6 B pages against 3 of 12 others');
+  assert.ok(!ranked.some((a) => a.tech === 'B' && a.finding === 'axe:x'), 'x is on 50% of pages with B and 50% without: not listed');
+});
+
+test('tech-findings: a tech on nearly every page is not compared (Google Ads, 59 of 60 pages)', () => {
+  const pages = [];
+  for (let i = 0; i < 59; i++) pages.push({ techs: ['Google Ads'], findings: i < 9 ? ['axe:aria-prohibited-attr'] : [] });
+  pages.push({ techs: [], findings: [] });
+  const m = buildCooccurrence(pages);
+  assert.equal(Math.round(lift(m, 'Google Ads', 'axe:aria-prohibited-attr') * 100) / 100, 1.02, 'the lift that confused readers');
+  assert.deepEqual(rankAssociations(m), []);
+  assert.deepEqual(onNearlyEveryPage(m), ['Google Ads']);
+});
+
+test('tech-findings: an Alfa finding is compared across the pages Alfa checked (Walsall, Alfa on half the pages)', () => {
+  const pages = [];
+  // Every page Alfa checked has sia-r66; Alfa happened to check more Amazon pages.
+  for (let i = 0; i < 64; i++) pages.push({ techs: ['Amazon Advertising'], engines: i < 34 ? ['axe', 'alfa'] : ['axe'], findings: i < 34 ? ['alfa:sia-r66', 'axe:x'] : ['axe:x'] });
+  for (let i = 0; i < 20; i++) pages.push({ techs: [], engines: i < 7 ? ['axe', 'alfa'] : ['axe'], findings: i < 7 ? ['alfa:sia-r66', 'axe:x'] : ['axe:x'] });
+  const m = buildCooccurrence(pages);
+  assert.deepEqual(m.engines.alfa, { pages: 41, tech: { 'Amazon Advertising': 34 } });
+  assert.deepEqual(rankAssociations(m), [], 'on every page Alfa checked, with or without the tech: 1×, not 1.5×');
+  assert.deepEqual(rankAssociations(m, { minRatio: 0 }).find((a) => a.finding === 'alfa:sia-r66'),
+    { tech: 'Amazon Advertising', finding: 'alfa:sia-r66', ratio: 1, lift: 1, pairPages: 34, techPages: 34, findingPages: 41, withoutPages: 7, withoutFindingPages: 7 });
+
+  const fleet = mergeFleet([{ domain: 'a', model: m }, { domain: 'b', model: m }]);
+  assert.equal(fleet.engines.alfa.pages, 82);
+  assert.equal(mergeFleet([{ domain: 'a', model: m }, { domain: 'old', model: { ...m, engines: undefined } }]).engines, undefined, 'an older model without per-engine counts falls back to all pages');
+});
+
+test('tech-findings: a finding never seen without the tech has no ratio and ranks first; weak ones are dropped', () => {
+  const pages = [];
+  for (let i = 0; i < 10; i++) pages.push({ techs: ['T'], findings: ['axe:only', ...(i < 6 ? ['axe:weak'] : [])] });
+  for (let i = 0; i < 10; i++) pages.push({ techs: [], findings: i < 5 ? ['axe:weak'] : [] });
+  const ranked = rankAssociations(buildCooccurrence(pages));
+  assert.deepEqual(ranked.map((a) => [a.finding, a.ratio]), [['axe:only', null]], 'weak: 60% against 50% is 1.2×, under 1.5×');
 });
 
 test('tech-findings: fleet merge counts distinct sites and scores breadth', () => {
@@ -1625,6 +1784,57 @@ test('extractAudits: pulls failing non-a11y audits, tags category, skips a11y/pa
   assert.equal(css.savingsMs, 350, 'max metricSavings ms captured');
   const seo = out.find((a) => a.id === 'meta-description');
   assert.equal(seo.category, 'seo', 'category tagged from auditRefs');
+});
+
+function protocolError(method, message) {
+  const err = new Error(`Protocol error (${method}): ${message}`);
+  err.protocolMethod = method;
+  return err;
+}
+
+test('isDetachedTargetError: matches only a child target closing while Lighthouse attaches', () => {
+  assert.ok(isDetachedTargetError(protocolError('Target.getTargetInfo', 'Session with given id not found.')));
+  assert.ok(isDetachedTargetError(protocolError('Network.enable', 'Session with given id not found.')));
+  assert.ok(!isDetachedTargetError(protocolError('Page.navigate', 'Session with given id not found.')), 'other methods still fail');
+  assert.ok(!isDetachedTargetError(protocolError('Target.getTargetInfo', 'Internal error')), 'other errors still fail');
+  assert.ok(!isDetachedTargetError(new Error('Session with given id not found.')), 'needs a protocol method');
+  assert.ok(!isDetachedTargetError(undefined));
+});
+
+test('isClosedSessionError: matches Lighthouse rejecting a check on a page that has closed', () => {
+  const late = 'Protocol error (Page.enable): Session closed. Most likely the page has been closed.';
+  assert.ok(isClosedSessionError(protocolError('Page.enable', 'Session closed. Most likely the page has been closed.')));
+  assert.ok(isClosedSessionError(Object.assign(new Error(late), { protocolMethod: 'Runtime.evaluate' })), 'any method');
+  assert.ok(!isClosedSessionError(new Error(late)), 'needs a protocol method');
+  assert.ok(!isClosedSessionError(protocolError('Page.navigate', 'Internal error')));
+  assert.ok(!isClosedSessionError(undefined));
+});
+
+test('guardDetachedTargetRejections: survives the detached-target rejection, still crashes on others', () => {
+  const mod = new URL('../../src/engines/lighthouse.js', import.meta.url).href;
+  const run = (method, message) => spawnSync(process.execPath, ['--input-type=module', '-e', `
+    const { guardDetachedTargetRejections } = await import(${JSON.stringify(mod)});
+    guardDetachedTargetRejections((m) => console.log(m));
+    const err = new Error(${JSON.stringify(message)});
+    err.protocolMethod = ${JSON.stringify(method)};
+    Promise.reject(err);
+    setTimeout(() => console.log('still running'), 50);
+  `], { encoding: 'utf8' });
+
+  const ignored = run('Target.getTargetInfo', 'Protocol error (Target.getTargetInfo): Session with given id not found.');
+  assert.equal(ignored.status, 0, ignored.stderr);
+  assert.match(ignored.stdout, /ignored a child target/);
+  assert.match(ignored.stdout, /still running/);
+
+  const late = run('Page.enable', 'Protocol error (Page.enable): Session closed. Most likely the page has been closed.');
+  assert.equal(late.status, 0, late.stderr);
+  assert.match(late.stdout, /ignored a late check on a page that had closed \(Page\.enable\)/);
+  assert.match(late.stdout, /still running/);
+
+  const fatal = run('Page.navigate', 'Protocol error (Page.navigate): Internal error');
+  assert.notEqual(fatal.status, 0);
+  assert.doesNotMatch(fatal.stdout, /still running/);
+  assert.match(fatal.stderr, /Internal error/);
 });
 
 test('assessAltText: classifies each alt-text problem', () => {

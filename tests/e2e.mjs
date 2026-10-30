@@ -80,8 +80,7 @@ function writeSite({ fixed }) {
       path.join(SITE, `page-${i}.html`),
       `<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><title>Page ${i}</title>
-<meta name="generator" content="WordPress 6.5">
-<script src="http://127.0.0.1:${PORT}/thirdparty.js"></script></head>
+${i % 2 === 0 || i % 3 === 0 ? '<meta name="generator" content="WordPress 6.5">\n' : ''}<script src="http://127.0.0.1:${PORT}/thirdparty.js"></script></head>
 <body><main><h1>Page ${i}</h1>
 ${broken ? '<img src="/pixel.png"><input type="text"><p style="color:#aaa;background:#fff">low contrast</p>' : `<img src="/pixel.png" alt="A test pixel"><label>Search <input type="text"></label><p>Readable text.</p>`}
 <p>This is a short paragraph of ordinary readable prose written so the plain language engine has real sentences to score. It deliberately contains one mispelled word for the spell check to catch, and enough words to count as content rather than navigation.</p>
@@ -99,7 +98,9 @@ ${fixed && i === 1 ? '<p><a href="/files/brand-new-week2.pdf">Newly added PDF</a
 <link rel="canonical" href="http://localhost:${PORT}/"></head>
 <body><main><h1>Fixture</h1><ul>${nav}</ul>
 <p><a rel="me" href="https://mastodon.social/@fixture">Follow us on Mastodon</a></p>
-<p><a href="/does-not-exist-404.html">A deliberately broken link</a></p></main></body></html>`
+<p><a href="/does-not-exist-404.html">A deliberately broken link</a></p>
+<p><a href="/moved-page.html">A page that redirects to page 1</a></p>
+<p><a href="/challenge.html">A page behind a firewall challenge</a></p></main></body></html>`
   );
   // 1x1 png
   fs.writeFileSync(path.join(SITE, 'pixel.png'), Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64'));
@@ -125,6 +126,8 @@ fs.writeFileSync(
 const SITE = ${JSON.stringify(SITE)};
 http.createServer((req, res) => {
   const reqPath = req.url.split('?')[0];
+  if (reqPath === '/moved-page.html') { res.writeHead(301, { location: '/page-1.html' }); res.end(); return; }
+  if (reqPath === '/challenge.html') { res.writeHead(202, { 'content-type': 'text/html', 'x-amzn-waf-action': 'challenge' }); res.end('<!DOCTYPE html><html><head><title>Challenge</title></head><body><img src="/x.png"></body></html>'); return; }
   const f = path.join(SITE, reqPath === '/' ? 'index.html' : reqPath);
   if (fs.existsSync(f) && fs.statSync(f).isFile()) {
     res.setHeader('content-type', f.endsWith('.png') ? 'image/png' : f.endsWith('.js') ? 'application/javascript' : f.endsWith('.xml') ? 'application/xml' : f.endsWith('.txt') ? 'text/plain' : 'text/html');
@@ -249,6 +252,28 @@ try {
   );
   assert(sampleRec.plainLanguage && typeof sampleRec.plainLanguage.wordCount === 'number', 'plain-language engine ran and recorded data');
 
+  // A page that redirects within the site is recorded once, under where it
+  // lands; the redirecting URL is kept in the crawl state as a redirect.
+  const w1Records = fs.readdirSync(path.join(SANDBOX, 'data', 'localhost', '2026-W23', 'pages'))
+    .map((f) => JSON.parse(fs.readFileSync(path.join(SANDBOX, 'data', 'localhost', '2026-W23', 'pages', f))));
+  assert(!w1Records.some((r) => r.url.endsWith('/moved-page.html')), 'a redirecting URL gets no page record of its own');
+  assert(w1Records.filter((r) => r.url.endsWith('/page-1.html')).length === 1, 'the page it lands on is recorded once');
+  const crawl1 = JSON.parse(fs.readFileSync(path.join(SANDBOX, 'state', 'localhost', 'crawl.json')));
+  const moved = Object.values(crawl1.pages).find((p) => p.url.endsWith('/moved-page.html'));
+  assert(moved && moved.lastStatus === 'redirect' && moved.redirectTo.endsWith('/page-1.html'), `the redirecting URL is marked as a redirect (got ${JSON.stringify(moved)})`);
+  const runsDir1 = path.join(SANDBOX, 'data', 'localhost', '2026-W23', 'runs');
+  const scannedTwice = fs.readdirSync(runsDir1)
+    .map((f) => JSON.parse(fs.readFileSync(path.join(runsDir1, f))).scanned)
+    .filter((ids) => new Set(ids).size !== ids.length);
+  assert(scannedTwice.length === 0, 'no page is audited twice in one run, even when a redirect lands on it first');
+
+  // A firewall challenge page is recorded as blocked and never audited.
+  const challengeRec = w1Records.find((r) => r.url.endsWith('/challenge.html'));
+  assert(challengeRec && challengeRec.blocked?.kind === 'challenge' && challengeRec.status === 202, `the challenge page is recorded as blocked (got ${JSON.stringify(challengeRec?.blocked)})`);
+  assert(!challengeRec.axe && !challengeRec.alfa, 'no audit engine ran on the challenge page');
+  assert(challengeRec.blocked.by.some((b) => b.startsWith('AWS WAF')), 'the firewall is named');
+  assert(w1.access?.firewall?.pages === 1 && w1.access.level === 'ok', `access counts the block without calling the site blocked (got ${JSON.stringify(w1.access)})`);
+
   // Image inventory: every page has a <img src="/pixel.png">, so images engine
   // should record at least one image per page with src and hasAlt fields.
   const pagesDir = path.join(SANDBOX, 'data', 'localhost', '2026-W23', 'pages');
@@ -265,18 +290,18 @@ try {
   assert(typeof firstImg.isDecorative === 'boolean', 'isDecorative field present');
 
   // Tech detection: the <meta name="generator" content="WordPress 6.5"> on
-  // every page should be picked up by the Wappalyzer fingerprints.
+  // page 2 should be picked up by the Wappalyzer fingerprints.
   const techPageRecs = fs.readdirSync(pagesDir)
     .map((f) => JSON.parse(fs.readFileSync(path.join(pagesDir, f))))
     .filter((r) => r.status === 200 && r.tech);
   assert(techPageRecs.length > 0, 'at least one page record has tech data');
-  const techResult = techPageRecs[0].tech;
+  const techResult = techPageRecs.find((r) => r.url.endsWith('/page-2.html'))?.tech;
   assert(Array.isArray(techResult) && techResult.length > 0, 'tech detection returned at least one technology');
   assert(techResult.some((t) => /wordpress/i.test(t.name)), 'WordPress detected via meta generator tag');
 
-  // Tech ↔ finding join: every page runs WordPress and the broken pages have
-  // image-alt violations, so the co-occurrence model should pair WordPress
-  // with image-alt, and the association list + sub-page should surface it.
+  // Tech ↔ finding join: WordPress runs on the even pages and every third
+  // page, which includes every broken page, so image-alt is only ever on
+  // WordPress pages. The comparison needs pages without it too.
   assert(w1.techFindings && w1.techFindings.model, 'techFindings model recorded in summary');
   assert(w1.techFindings.model.tech.WordPress >= 5, 'WordPress co-occurrence has enough page support');
   assert('axe:image-alt' in w1.techFindings.model.finding, 'image-alt tracked as a finding key');
@@ -290,6 +315,8 @@ try {
   // findingLabel() renders the human-readable rule label, not the raw id,
   // so match the plain-language text for axe:image-alt.
   assert(/WordPress/.test(tfHtml) && /meaningful alt attribute/.test(tfHtml), 'tech-findings page lists WordPress and the image-alt finding');
+  assert(/<a href="accessible\.html#VS-[^"]+">[^<]*meaningful alt attribute/.test(tfHtml), 'each finding links to its full report on the Accessibility page');
+  assert(/only with it/.test(tfHtml), 'a finding never seen without WordPress says so');
   const w1index = fs.readFileSync(path.join(SANDBOX, 'docs', 'reports', 'localhost', '2026-W23', 'index.html'), 'utf8');
   assert(/href="tech-findings.html">Tech/.test(w1index), 'subnav links to tech-findings page');
 
@@ -340,6 +367,18 @@ try {
   // --- 3. Week 2: violations fixed ------------------------------------
   writeSite({ fixed: true });
   run('src/scan.js', ['--domain', 'localhost', '--budget', '100', '--base-url', `http://localhost:${PORT}`], '2026-W24');
+  // PDF check results as the pdf-audit workflow writes them (it needs
+  // pdf-crawler's Python checker, so the e2e run supplies them).
+  const pdfBase = `http://localhost:${PORT}/files`;
+  const checks = (o) => ({ tagged: 'fail', title: 'pass', language: 'pass', bookmarks: null, taggedContent: 'fail', figuresAlt: null, headings: null, lists: null, tables: null, forms: null, taggedForms: null, taggedAnnotations: null, emptyText: 'fail', protected: 'pass', ...o });
+  fs.writeFileSync(path.join(SANDBOX, 'data', 'localhost', 'pdf-audit.json'), JSON.stringify({
+    domain: 'localhost',
+    checker: { name: 'pdf-crawler', ref: '9f079bac419b9d2b62cc325c5589df012a99e251' },
+    pdfs: {
+      [`${pdfBase}/report-1.pdf`]: { status: 'analysed', checkedAt: '2026-06-12T22:41:00Z', week: '2026-W24', attempts: 0, report: { accessible: false, title: 'Annual report 1', pages: 12, published: '2025-04-01', checks: checks() } },
+      [`${pdfBase}/report-2.pdf`]: { status: 'error', checkedAt: '2026-06-12T22:41:00Z', week: '2026-W24', attempts: 1, httpStatus: 404, errors: ['HTTP 404'] },
+    },
+  }));
   run('src/aggregate.js', [], '2026-W24');
 
   const weekly = JSON.parse(fs.readFileSync(path.join(SANDBOX, 'docs', 'data', 'localhost', 'weekly.json')));
@@ -447,6 +486,17 @@ try {
   // Dashboard uses the trailing-7-day window ("Pages audited (7d)" header).
   assert(/Pages audited \(7d\)/.test(dash), 'dashboard column reflects the rolling 7-day window');
   // Archive page exists and lists weeks; subnav links to it.
+  const pdfsPage = fs.readFileSync(path.join(SANDBOX, 'docs', 'reports', 'localhost', '2026-W24', 'pdfs.html'), 'utf8');
+  assert(/<a class="url" href="http:\/\/localhost:\d+\/files\/report-1\.pdf"[^>]*>report-1\.pdf<\/a><br><span class="bug-meta">Annual report 1<\/span>/.test(pdfsPage), 'PDFs page lists a checked PDF with its title');
+  assert(/<span class="error">Issues found<\/span>/.test(pdfsPage) && /<span class="error">Fail<\/span>/.test(pdfsPage), 'PDF results are text');
+  assert(/id="h-pdfs-errors"/.test(pdfsPage) && /<td>HTTP 404<\/td>/.test(pdfsPage), 'a PDF that could not be checked says why');
+  assert(/Checks are off for this site/.test(pdfsPage), 'the page says how to run checks where pdf_audit is off');
+  assert(/<code>9f079ba<\/code>/.test(pdfsPage), 'the checker commit is named');
+  const pdfCsv = fs.readdirSync(path.join(SANDBOX, 'docs', 'reports', 'localhost', '2026-W24')).find((f) => f.endsWith('_pdfs.csv'));
+  assert(pdfCsv && pdfsPage.includes(`href="${pdfCsv}"`), 'the PDFs CSV is written and linked');
+  const oldPdfs = fs.readFileSync(path.join(SANDBOX, 'docs', 'reports', 'localhost', '2026-W23', 'pdfs.html'), 'utf8');
+  assert(/latest week/.test(oldPdfs) && !/report-1\.pdf/.test(oldPdfs), 'an older week points to the latest instead of repeating current results');
+
   const archivePath = path.join(SANDBOX, 'docs', 'reports', 'localhost', '2026-W24', 'archive.html');
   assert(fs.existsSync(archivePath), 'archive page written');
   const archiveHtml = fs.readFileSync(archivePath, 'utf8');
@@ -456,7 +506,7 @@ try {
   // page (including archive.html) carries the identical full subnav. A
   // criterion with no data this week still renders, with an empty-state page.
   const weekDir = path.join(SANDBOX, 'docs', 'reports', 'localhost', '2026-W23');
-  const SUBPAGES = ['index', 'accessible', 'standards', 'security', 'errors', 'fast', 'findable', 'tech', 'tech-findings', 'third-parties', 'images', 'history', 'archive'];
+  const SUBPAGES = ['index', 'accessible', 'standards', 'security', 'errors', 'fast', 'findable', 'tech', 'tech-findings', 'third-parties', 'images', 'pdfs', 'history', 'archive'];
   const navOf = (html) => {
     const m = html.match(/<nav class="subnav"[\s\S]*?<\/nav>/);
     if (!m) return null;

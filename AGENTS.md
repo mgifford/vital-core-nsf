@@ -38,7 +38,7 @@ compact, comparison-friendly record onto the per-page JSON.
 |-------------|------|------------------|
 | `src/engines/axe.js` | **axe-core** (injected into the page) | WCAG 2.x / Section 508 violations, reduced to rule ids, counts, and pages affected (full node lists are not stored). |
 | `src/engines/alfa.js` | **Siteimprove Alfa** (`@siteimprove/alfa-*`) | Independent ACT-rules audit. Alfa is the open source core of Siteimprove's commercial checker. |
-| `src/engines/plain-language.js` | text analysis (in-page) | Readability (Flesch / Flesch-Kincaid), sentence/passive-voice heuristics, unexplained acronyms. `scored: false` when there's too little prose. |
+| `src/engines/plain-language.js` | text analysis (in-page) | Readability (Flesch / Flesch-Kincaid), sentence/passive-voice heuristics, unexplained acronyms, and spelling against the target's `spelling_locale` dictionary (`src/lib/spell.js`; en-US default, en-GB, en-CA, en-AU). `scored: false` when there's too little prose. |
 | `src/engines/deprecated-html.js` | DOM query (in-page) | Obsolete/legacy HTML (`<font>`, `<center>`, `<marquee>`, presentational attrs). Example of a rate-controlled scanner. |
 | `src/engines/sustainability.js` | **co2.js** (`@tgwf/co2`, SWD model v4) | Page weight (decoded body bytes) and estimated emissions. |
 | `src/engines/lighthouse.js` | **Google Lighthouse** (own Chrome) | Performance / accessibility / best-practices / SEO / agentic-browsing scores + Core Web Vitals, plus the failing non-a11y **audits** (recommendations) via `extractAudits`. Drives its own browser. Aggregated into `summary.lighthouse.recommendations` and rendered on `lighthouse.html`. |
@@ -100,11 +100,18 @@ in bug reports.
 
 `src/lib/tech-findings.js` joins each page's detected technologies with its
 accessibility findings (both already in the page record), building a
-per-page co-occurrence model in `summarizeRecords`. **Lift** =
-`P(finding | tech) / P(finding)` quantifies over-representation; only pages
-where both tech and an accessibility engine ran are counted, with a 5-page
-minimum support. The model is stored on the weekly summary (`techFindings`,
-~9 KB), rendered per-domain as `tech-findings.html`, and merged across
+per-page co-occurrence model in `summarizeRecords`. The per-domain page
+lists a finding when it is at least 1.5 times as common on pages with a
+technology as on pages without it (`rankAssociations`), with at least 5 pages
+with the tech, with both, and without the tech; a tech on nearly every page
+has nothing to compare against and is named as not compared. Comparing with
+all pages instead (**lift** = `P(finding | tech) / P(finding)`, still in the
+data for API consumers) gave a tech on 59 of 60 pages a lift of 1.02 for
+every finding. Only pages where both tech and an accessibility engine ran
+are counted. The model is stored on the weekly summary (`techFindings`,
+~9 KB) and ranked when rendered, so older weeks follow the current rule.
+Each finding links to its report on the Accessibility page. It is rendered
+per-domain as `tech-findings.html`, and merged across
 domains on the dashboard (`mergeFleet` / `rankFleetAssociations`) into the
 **Cross-technology issues** matrix scored by `lift × sites`. It is an
 *association* surface — co-located technologies share identical lift, so the
@@ -173,6 +180,7 @@ The durable surface guide is `kitty-specs/AGENT_SURFACES.md`.
 6. Include tests for behavior changes in discovery, scanning, or aggregation.
 7. Avoid broad refactors unless requested.
 8. **Clean up branches after merging.** When a PR is merged, immediately delete the feature branch — do not leave it in the remote. Use `git push origin --delete <branch>` or the GitHub UI. Stale branches accumulate and obscure active work. The only branches that should exist at any time are `main`, any branch with an open PR, and branches actively being worked on in the current session.
+9. **Fleets send engine fixes upstream.** In a repo made from this template (a fleet such as `vital-core-nsf`), record discoveries every fleet would want in `docs-internal/UPSTREAM-SUGGESTIONS.md`, and fix them in vital-core on a branch from `upstream/main`. Never copy changes across by hand. See CLAUDE.md, "Fleets made from this template".
 
 ## Testing
 

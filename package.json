@@ -14,6 +14,7 @@
     "check:public-interest": "node scripts/check-public-interest.js",
     "check:alfa-metadata": "node scripts/validate-alfa-metadata.js",
     "check:ollama": "node scripts/check-ollama.js",
+    "diagnose": "node scripts/probe-targets.js",
     "i18n:extract": "node scripts/i18n-extract.js",
     "i18n:check": "node scripts/i18n-extract.js --check",
     "sync:hosting": "bash scripts/sync-hosting-branches.sh",
@@ -40,9 +41,13 @@
     "axe-core": "^4.12.1",
     "chrome-launcher": "^1.2.1",
     "dictionary-en": "^4.0.0",
+    "dictionary-en-au": "^3.0.0",
+    "dictionary-en-ca": "^3.0.0",
+    "dictionary-en-gb": "^3.0.0",
     "lighthouse": "^13.5.0",
     "nspell": "^2.1.5",
     "playwright": "^1.56.0",
+    "tldts-icann": "^7.4.18",
     "yaml": "^2.9.0"
   }
 }
