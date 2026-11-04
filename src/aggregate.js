@@ -37,6 +37,8 @@ import { sanitizeBugEvidence } from './lib/finding-reporting.js';
 import { computeTrainingPriorities } from './lib/training-priorities.js';
 import { isAvailable as ollamaAvailable, chat as ollamaChat, detectModel as ollamaDetectModel } from './lib/ollama.js';
 import { createClusterTracker } from './lib/component-clusters.js';
+import { createSharedComponentTracker, actionIdsOutsideComponents } from './lib/shared-components.js';
+import { createPageFamilyTracker } from './lib/page-families.js';
 
 // Fixed tolerance band (in percentage points) for rate-based diff comparisons.
 // Same value used by deriveTrend() in ai-findings.js so the two views agree.
@@ -759,11 +761,15 @@ function summarizeRecords(target, week, records, brokenLinks) {
   // Third-party rollup: one row per page the third-party engine ran on.
   const thirdPartyPages = []; // { pageUrl, hasFindings, origins[] }
   const clusterTracker = createClusterTracker(target);
+  const componentTracker = createSharedComponentTracker(target.componentSignatures);
+  const familyTracker = createPageFamilyTracker(target.pageFamilies);
 
   // brokenLinks is supplied by the caller (folded from run logs).
 
   for (const rec of files) {
     pagesScanned++;
+    familyTracker.observe(rec.url, Boolean(rec.axe || rec.alfa));
+    componentTracker.observeState(rec.componentObservation);
     if (rec.axe || rec.alfa || rec.sustainability || rec.plainLanguage || rec.lighthouse) pagesWithAudit++;
     if (typeof rec.status === 'number' && rec.status >= 400) {
       errorPages.push({ url: rec.url, status: rec.status });
@@ -783,6 +789,7 @@ function summarizeRecords(target, week, records, brokenLinks) {
         if (r.affectedPages.length < MAX_AFFECTED_PAGES) r.affectedPages.push({ url: rec.url, instances: v.count });
         addInstances(r, rec.url, v.examples);
         clusterTracker.observe('axe-core', id, v.impact ?? null, rec.url, v.examples);
+        componentTracker.observe('axe-core', id, rec.url, v.examples, v.count);
       }
     }
     if (rec.alfa) {
@@ -798,6 +805,7 @@ function summarizeRecords(target, week, records, brokenLinks) {
         if (r.affectedPages.length < MAX_AFFECTED_PAGES) r.affectedPages.push({ url: rec.url, instances: v.count });
         addInstances(r, rec.url, v.examples);
         clusterTracker.observe('alfa', id, null, rec.url, v.examples);
+        componentTracker.observe('alfa', id, rec.url, v.examples, v.count);
       }
     }
     if (rec.deprecatedHtml) {
@@ -809,6 +817,7 @@ function summarizeRecords(target, week, records, brokenLinks) {
         if (r.affectedPages.length < MAX_AFFECTED_PAGES) r.affectedPages.push({ url: rec.url, instances: v.count });
         addInstances(r, rec.url, v.examples);
         clusterTracker.observe('deprecated-html', id, null, rec.url, v.examples);
+        componentTracker.observe('deprecated-html', id, rec.url, v.examples, v.count);
       }
     }
     if (rec.resources) {
@@ -1206,10 +1215,17 @@ function summarizeRecords(target, week, records, brokenLinks) {
     // Third-party resource/JS cost rolled up per vendor across the pages the
     // third-party engine ran on. Page-resolved (3rd-party JS varies per page).
     thirdParty: thirdPartyPages.length ? rollupThirdParty(thirdPartyPages) : null,
-    componentClusters: clusterTracker.finalize(
-      pagesScanned,
-      target.reporting?.template_page_threshold ?? 10
-    ),
+    ...(() => {
+      const sharedComponents = componentTracker.finalize({
+        thirdParty: thirdPartyPages.length ? rollupThirdParty(thirdPartyPages) : null,
+        pagesAudited: auditedPageIds.size,
+      });
+      const componentClusters = clusterTracker.finalize(pagesScanned, target.reporting?.template_page_threshold ?? 10);
+      const outside = actionIdsOutsideComponents(componentClusters.clusters, sharedComponents);
+      if (outside) componentClusters.top_action_ids_outside_components = outside;
+      return { componentClusters, sharedComponents };
+    })(),
+    pageFamilies: familyTracker.finalize(),
   };
 }
 

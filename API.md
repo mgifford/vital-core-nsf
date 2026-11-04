@@ -132,6 +132,50 @@ observation-based heuristics, not verified task counts or causal ownership.
 Queue items now explicitly say `counting_basis: engine_observations_not_tasks`
 and `remediation_task_count: null`. No API version bump or data migration occurs.
 
+### Shared-component scope and page families (additive v1 fields)
+
+Both are opt-in per target (`component_signatures`, `page_families` in
+`config/targets.yml`). Without them none of these fields appear, except that
+`reporting.component_scope` is `null`.
+
+- `findings[].reporting.component_scope`: how the stored failing-element
+  examples relate to a configured component. `classification` is
+  `shared_component`, `mixed`, `candidate_shared_component`, `not_attributed`
+  or `undetermined`. `verified` is true only when at least `min_signals`
+  distinct signal types agree (`class`, `id`, `attribute`, `ancestry` of the
+  selector, and the component's `script_origin` seen on the site), including one
+  about the element itself. One CSS prefix alone is a candidate, never
+  verified. Counts say `basis: "stored_examples"`: the scanner keeps a few
+  examples per rule and page, so this is sample-based, not every instance.
+- `scope_of_analysis.shared_components`: per-component confidence, signals
+  observed and finding counts. `scope_of_analysis.page_families`: URL counts,
+  declared implementation counts (`implementation_basis: "configured_route"`),
+  state-parameter counts and distinct variant-value counts. No URLs or selectors
+  appear in either block. Only the values of the parameters a target lists in
+  `state_params` are shown (at most 20 per parameter); `variant_params` are
+  counted, never listed.
+- `scope_of_analysis.shared_components.components[].observation` (null when never
+  observed): a best-effort count, taken read-only before the audits, of pages
+  where the component was present, visible and shown as a dialog, with up to 8
+  visible button labels. Page records carry `componentObservation`, and run
+  logs carry `browser` (user agent and viewport). The scanner never clicks or
+  removes anything. What a component shows can vary by visitor and location, so
+  these counts describe only the scanner's view and are not comparable between
+  sites.
+- `findings[].reporting.page_family` (null when none applies): the declared page
+  family the finding's URLs fall in, with `urls_in_family`, `urls_observed`,
+  `all_urls_in_family` and `implementation_count` (basis `configured_route`).
+- `signals` in `component_scope` may include `dom_ancestry`: the scanner found a
+  configured signature on the failing element or a real DOM ancestor, recorded
+  at scan time as `component` on axe examples in page records. Only axe examples
+  with a plain CSS selector can be resolved this way; Alfa examples cannot.
+- Weekly summaries carry `componentClusters.top_action_ids_outside_components`,
+  the ids of the highest-ranked clusters that are not verified shared-component
+  findings.
+- Grouping never merges findings, changes `pattern_id`/`instance_id`, or alters
+  scores. Page-family counts do not change page identity: every query variant is
+  still its own URL.
+
 ### Snapshot Contents
 
 Full per-domain history: a `summary` block (severity counts + pages scanned),
