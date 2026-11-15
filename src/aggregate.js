@@ -4,13 +4,14 @@ import path from 'node:path';
 import { loadConfig, loadProfile, applyProfile, DIRS, DEFAULT_SPELLING_LOCALE } from './lib/config.js';
 import { isoWeek, compareWeeks, weekToDateStamp } from './lib/week.js';
 const filePfx = (domain, week) => `${domain}_${weekToDateStamp(week)}`;
-import { renderDomainReport, renderIndex, writeAsset, setSustainabilityMetric, setLocale, setReportLanguages, renderLighthousePage, renderReadabilityPage, renderTechPage, renderArchivePage, renderAccessibilityPage, renderStandardsPage, renderSecurityPage, renderErrorsPage, renderImagesPage, renderPdfsPage, renderTechFindingsPage, renderThirdPartyPage, renderUrlLookup, renderHistoryPage, redirectStub, PAGE_REDIRECTS } from './report-html.js';
+import { renderDomainReport, renderIndex, writeAsset, setSustainabilityMetric, setInteractiveCharts, setLocale, setReportLanguages, renderLighthousePage, renderReadabilityPage, renderTechPage, renderArchivePage, renderAccessibilityPage, renderExplorerPage, renderStandardsPage, renderSecurityPage, renderErrorsPage, renderImagesPage, renderPdfsPage, renderTechFindingsPage, renderThirdPartyPage, renderUrlLookup, renderHistoryPage, renderArchiveEvidencePage, redirectStub, PAGE_REDIRECTS } from './report-html.js';
 import { buildBugReports, bugReportsMarkdown } from './lib/bug-report.js';
+import { summarizeEvidenceCoverage } from './lib/evidence-coverage.js';
 import { loadPriorityUrls } from './lib/top-tasks.js';
 import { loadFindings, saveFindings, updateFindings } from './lib/findings.js';
 import { weekDeltas, severityBurndown, streaks, deltaSeries } from './lib/progress.js';
 import { loadPdfLedger, pdfReportView } from './lib/pdf-audit.js';
-import { writeCsvs, writeBugsCsv, writeErrorsCsv, writeResourceCsv, writeLighthouseCsv, writeLighthouseJson, writeReadabilityCsv, writeSpellingCsv, writeAcronymsCsv, writeTechCsv, writeImagesCsv, writePdfsCsv, writeThirdPartyCsv, writePriorityPages, writeComponentClusterCsvs, writeTrendsCsv } from './lib/csv.js';
+import { writeCsvs, writeBugsCsv, writeErrorsCsv, writeResourceCsv, writeLighthouseCsv, writeLighthouseJson, writeReadabilityCsv, writeSpellingCsv, writeAcronymsCsv, writeTechCsv, writeImagesCsv, writePdfsCsv, writeThirdPartyCsv, writePriorityPages, writeComponentClusterCsvs, writeTrendsCsv, writeRegionCsv } from './lib/csv.js';
 import { buildConsensus } from './lib/consensus.js';
 import { loadInventory, saveInventory, updateInventory, inventorySummary } from './lib/inventory.js';
 import { resolvePageRecord } from './lib/page-records.js';
@@ -23,16 +24,22 @@ import { loadThirdPartyLedger, saveThirdPartyLedger, updateThirdPartyLedger } fr
 import { buildAiFindings } from './lib/ai-findings.js';
 import { applyFindingPolicy } from './lib/finding-policy.js';
 import { buildIndexEntry, buildSnapshot, buildWeekFindings, writeApiFiles } from './lib/api-writer.js';
+import { readArchiveIndex, withArchiveState, writeArchiveApi } from './lib/retention-archive-index.js';
+import { syncObservationsFromRecords, observationSummary as summarizeObservations } from './lib/observations.js';
 import { filterBugsByExclusion } from './report-html.js';
 import { redactBugs } from './lib/api-redact.js';
+import { condenseInstance, MAX_RULE_INSTANCES, pickBrowserContext } from './lib/element-evidence.js';
+import { buildComponentGroups, buildRegionGroups, buildWidgetGroups, findingsFromRules } from './lib/region-groups.js';
 import { buildUrlIndex, writeUrlIndex } from './lib/url-index.js';
 import { assessAccess, withoutBlockedAudits } from './lib/access.js';
 import { omitHeavyLists, trendSeries } from './lib/trend.js';
 import { withCurrentGovernmentCheck } from './engines/security.js';
 import { buildLlmsTxt } from './lib/llms-txt.js';
 import { writeApiCatalog } from './lib/api-catalog.js';
+import { LH_METRIC_AUDITS } from './engines/lighthouse.js';
 import { summarizeDistribution } from './lib/distribution.js';
 import { writeAcrYaml } from './lib/acr.js';
+import { writeWcagEmReport } from './lib/wcag-em.js';
 import { sanitizeBugEvidence } from './lib/finding-reporting.js';
 import { computeTrainingPriorities } from './lib/training-priorities.js';
 import { isAvailable as ollamaAvailable, chat as ollamaChat, detectModel as ollamaDetectModel } from './lib/ollama.js';
@@ -56,7 +63,6 @@ const DIFF_TOLERANCE_PP = 0.02;
  *   docs/data/<domain>/weekly.json      (trend series for anyone to reuse)
  */
 
-const MAX_RULE_INSTANCES = 5; // representative failing instances kept per rule
 const MAX_AFFECTED_PAGES = 5000; // full affected-page list cap per rule (for CSV)
 const MAX_RESOURCE_EXAMPLE_PAGES = 5; // source pages kept per resource (issue #217)
 
@@ -68,6 +74,7 @@ const profile = loadProfile(process.env.VITAL_PROFILE);
 const config = applyProfile(loadConfig(), profile);
 if (profile) console.log(`Building profile "${profile.name}" (${config.targets.length} targets).`);
 setSustainabilityMetric(config.sustainabilityMetric);
+setInteractiveCharts(config.interactiveCharts);
 fs.mkdirSync(DIRS.docs, { recursive: true });
 
 // Bugs fed into the static JSON API must honor the same render-time
@@ -90,15 +97,18 @@ const apiIndexEntries = [];
 const apiSnapshots = [];
 const apiWeekFindings = [];
 const urlLookupDomains = [];
+const archiveIndexes = [];
 
 for (const target of config.targets) {
   const domainDir = path.join(DIRS.data, target.key);
   if (!fs.existsSync(domainDir)) {
-    unscanned.push({ target, access: assessAccess() });
+    if (!target.unlisted) unscanned.push({ target, access: assessAccess() });
     continue;
   }
   const reporting = target.reporting ?? {};
   const keyPages = reporting.include_key_page_issues ? loadPriorityUrls(target) : [];
+  const archiveIndex = withArchiveState(readArchiveIndex(domainDir, target.key));
+  const archiveByWeek = new Map(archiveIndex.archives.map((entry) => [entry.week, entry]));
 
   const weeks = fs.readdirSync(domainDir).filter((w) => /^\d{4}-W\d{2}$/.test(w)).sort(compareWeeks);
   const series = [];
@@ -106,7 +116,12 @@ for (const target of config.targets) {
   for (const week of weeks) {
     const summary = summarizeWeek(target, week);
     if (summary) {
+      summary.evidenceCoverage = summarizeEvidenceCoverage(summary);
       series.push(summary);
+      // The region CSV is written later, but its name is deterministic, so
+      // record it here: summary.json is written below and a pruned week must
+      // still link to the export it shipped with.
+      if (summary.regions) summary.regions.csv = `${filePfx(target.domain, week)}_regions.csv`;
       const summaryPath = path.join(domainDir, week, 'summary.json');
       // summarizeRecords() stamps a fresh generatedAt on every call, even
       // for weeks whose underlying page data hasn't changed since the last
@@ -129,7 +144,7 @@ for (const target of config.targets) {
   }
   if (series.length === 0) {
     const lastWeek = weeks[weeks.length - 1];
-    unscanned.push({ target, access: assessAccess({ runs: lastWeek ? readRunLogs(path.join(domainDir, lastWeek, 'runs')) : [] }) });
+    if (!target.unlisted) unscanned.push({ target, access: assessAccess({ runs: lastWeek ? readRunLogs(path.join(domainDir, lastWeek, 'runs')) : [] }) });
     continue;
   }
 
@@ -137,15 +152,22 @@ for (const target of config.targets) {
   // Updated incrementally from each retained week's page records (older
   // weeks may already be pruned, but their results persist in inventory).
   const inventory = loadInventory(target.key, target.domain);
+  const observationRecords = [];
   for (const week of weeks) {
     const pagesDir = path.join(domainDir, week, 'pages');
     if (!fs.existsSync(pagesDir)) continue;
     const records = fs.readdirSync(pagesDir)
       .filter((f) => f.endsWith('.json'))
       .map((f) => resolvePageRecord(domainDir, JSON.parse(fs.readFileSync(path.join(pagesDir, f), 'utf8'))));
+    observationRecords.push(...records);
     updateInventory(inventory, week, withoutBlockedAudits(records));
   }
   saveInventory(target.key, inventory);
+  const observationIndex = syncObservationsFromRecords(target.key, target.domain, observationRecords);
+  const observationSummary = summarizeObservations(observationIndex, {
+    now: new Date(),
+    staleDays: Math.max(7, (target.retentionPolicy?.live?.weeks ?? 2) * 7),
+  });
   const invSummary = inventorySummary(inventory, series[series.length - 1].week);
 
   // Week-over-week diffs between consecutive summaries.
@@ -257,6 +279,24 @@ for (const target of config.targets) {
     const repDir = path.join(DIRS.docs, 'reports', target.key, summary.week);
     fs.mkdirSync(repDir, { recursive: true });
 
+    // Historical screenshots are captured into data/; copy only the files the
+    // week's findings reference into the published report directory.
+    const screenshotNames = new Set();
+    for (const bug of reportBugs) {
+      for (const example of bug.examples ?? []) {
+        if (example.screenshot?.available && example.screenshot.file_name) screenshotNames.add(example.screenshot.file_name);
+      }
+    }
+    if (screenshotNames.size) {
+      const srcDir = path.join(DIRS.data, target.key, summary.week, 'screenshots');
+      const dstDir = path.join(repDir, 'screenshots');
+      fs.mkdirSync(dstDir, { recursive: true });
+      for (const name of screenshotNames) {
+        const src = path.join(srcDir, name);
+        if (fs.existsSync(src)) fs.copyFileSync(src, path.join(dstDir, name));
+      }
+    }
+
     // CSVs of affected pages, then link each bug to its per-rule CSV.
     const csvLinks = writeCsvs(repDir, summary);
     const clusterCsvLinks = writeComponentClusterCsvs(repDir, summary);
@@ -342,8 +382,12 @@ for (const target of config.targets) {
     const bugsJsonName = `${pfx2}_bugs.json`;
     const aiJsonName = `${pfx2}_ai-findings.json`;
 
-    // OpenACR YAML — written before the accessibility page so the path is available for the download link.
-    const acrResult = writeAcrYaml(repDir, target, summary, summary.week);
+    // Evaluation artifact — OpenACR for procurement (US default), or a
+    // WCAG-EM-aligned automated pre-assessment for website evaluations. Written
+    // before the accessibility page so the download link is available.
+    const ar = target.evaluationReport ?? 'openacr';
+    const acrResult = ar === 'wcag-em' ? null : writeAcrYaml(repDir, target, summary, summary.week);
+    const wcagEmResult = ar === 'openacr' ? null : writeWcagEmReport(repDir, target, summary, summary.week);
 
     // Training priorities: top WCAG SCs by pages affected, with optional Ollama advice.
     const trainingPriorities = computeTrainingPriorities(reportBugs);
@@ -369,6 +413,11 @@ for (const target of config.targets) {
       summary.techJson = techJsonName;
     }
     const tpCsv = summary.thirdParty?.vendors?.length ? writeThirdPartyCsv(repDir, target.domain, summary.week, summary) : null;
+    // Region grouping is sample-based; the CSV is the complete grouped export.
+    if (summary.regions) {
+      const regionCsv = writeRegionCsv(repDir, target.domain, summary.week, summary.regions);
+      if (regionCsv) summary.regions.csv = regionCsv;
+    }
     const imagesCsv = summary.images?.imageRows?.length ? writeImagesCsv(repDir, target.domain, summary.week, summary) : null;
     // Deduplicated image inventory as JSON (src, alt, bytes, occurrences,
     // alt-text verdict, example pages).
@@ -416,6 +465,8 @@ for (const target of config.targets) {
       // Filenames are outcome-aligned (accessible/fast/findable/third-parties);
       // a redirect stub is written at each old basename below so existing deep
       // links keep working.
+      // Finding Explorer: static index always; filters/detail need JavaScript.
+      fs.writeFileSync(path.join(repDir, `explore${sfx}.html`), renderExplorerPage(target, summary, reportBugs, { bugsJson: bugsJsonName }));
       fs.writeFileSync(path.join(repDir, `accessible${sfx}.html`), renderAccessibilityPage(target, summary, reportBugs, csvLinks, {
         ...reporting, keyPages,
         priorityPagesCsv: priorityPages.csv,
@@ -424,7 +475,8 @@ for (const target of config.targets) {
         aiJson: aiJsonName,
         policySummary: policyResult.suppressionSummary,
         clusterCsvLinks,
-        acrYaml: acrResult.path,
+        acrYaml: acrResult?.path ?? null,
+        wcagEm: wcagEmResult?.path ?? null,
         trainingPriorities,
         trainingAdvice,
       }, target.url_exclude_patterns ?? []));
@@ -443,8 +495,10 @@ for (const target of config.targets) {
       fs.writeFileSync(path.join(repDir, `history${sfx}.html`), renderHistoryPage(target, series, summary.week));
       // Archive page (all weeks). Written in each week folder so the subnav
       // "Archive" link resolves from any week's report.
-      const archiveHtml = renderArchivePage(target, series, series[series.length - 1].week);
+      const archiveHtml = renderArchivePage(target, series, series[series.length - 1].week, archiveIndex, observationSummary);
       if (archiveHtml) fs.writeFileSync(path.join(repDir, `archive${sfx}.html`), archiveHtml);
+      fs.writeFileSync(path.join(repDir, `evidence${sfx}.html`),
+        renderArchiveEvidencePage(target, summary, archiveByWeek.get(summary.week) ?? null, series[series.length - 1].week));
       fs.writeFileSync(path.join(repDir, `index${sfx}.html`),
         renderDomainReport(target, summary, prev, diffs[summary.week] ?? null, series, reportBugs, csvLinks, isLatest ? invSummary : null, progress));
       // Redirect stubs at the pre-rename basenames (hash-preserving), for this
@@ -487,10 +541,13 @@ for (const target of config.targets) {
 
   const latestSummary = series[series.length - 1];
   const latestBugsOnly = apiBugsFor(target, latestBugs.map(({ _week, ...b }) => b));
-  apiIndexEntries.push(buildIndexEntry(target, latestSummary, latestBugsOnly));
+  // An unlisted site keeps its snapshot and findings files (its own report
+  // pages link to them) but stays out of index.json, and so out of llms.txt
+  // and the API catalog, which are built from the index.
+  if (!target.unlisted) apiIndexEntries.push(buildIndexEntry(target, latestSummary, latestBugsOnly));
   apiSnapshots.push({ key: target.key, data: buildSnapshot(target, trend, diffs, ledger, invSummary, latestBugsOnly, latestPolicySummary) });
 
-  const urlIdx = buildUrlIndex(domainDir, target.domain, latestSummary.week);
+  const urlIdx = target.unlisted ? null : buildUrlIndex(domainDir, target.domain, latestSummary.week);
   if (urlIdx) {
     writeUrlIndex(path.join(DIRS.docs, 'api', 'v1'), target.key, urlIdx);
     urlLookupDomains.push({ key: target.key, domain: target.domain, week: latestSummary.week });
@@ -534,7 +591,8 @@ for (const target of config.targets) {
   // window is empty (e.g. old data only).
   const windowSummary = summarizeWindow(target, 7) ?? series[series.length - 1];
 
-  dashboard.push({ target, series, diffs, inventory: invSummary, bugs: latestBugs, windowSummary });
+  if (!target.unlisted) dashboard.push({ target, series, diffs, inventory: invSummary, bugs: latestBugs, windowSummary });
+  archiveIndexes.push({ ...archiveIndex, domain: target.key, unlisted: target.unlisted });
   console.log(`${target.key}: ${series.length} week(s) aggregated, ${Object.keys(ledger.findings).length} tracked findings`);
 }
 
@@ -552,6 +610,7 @@ for (const locale of config.languages) {
 setLocale(config.defaultLanguage);
 writeAsset(DIRS.docs);
 writeApiFiles(DIRS.docs, apiIndexEntries, apiSnapshots, apiWeekFindings);
+writeArchiveApi(DIRS.docs, archiveIndexes);
 fs.writeFileSync(path.join(DIRS.docs, 'llms.txt'), buildLlmsTxt(config, apiIndexEntries));
 writeApiCatalog(DIRS.docs, config, apiIndexEntries);
 console.log('docs/ written');
@@ -680,6 +739,11 @@ function summarizeRecords(target, week, records, brokenLinks) {
   const axeRules = {}; // ruleId -> { count, pages, impact, help, helpUrl, examples }
   const alfaRules = {};
   const deprecatedRules = {}; // ruleId -> { count, pages, help, examplePages, instances }
+  // Render/evidence context is identical for every page in a run, so it is
+  // kept once on the summary rather than copied per rule.
+  let axeContext = null;
+  let axeEvidenceFailures = 0;
+  let alfaEvidence = null;
   const enginePageCounts = {}; // engine -> unique pages it ran on (coverage)
   const resourceMap = new Map(); // resource url -> { url, type, foundOn:Set }
   // Standards (per-page): checkId -> { label, pass, total } pass counts.
@@ -713,6 +777,7 @@ function summarizeRecords(target, week, records, brokenLinks) {
   // is inherently deduplicated.
   const axeCountsPerPage = [];
   const alfaCountsPerPage = [];
+  const alfaSkipped = [];
   const auditedPageIds = new Set(); // pages scanned by axe and/or alfa
   const pagesWithAxe = []; // URLs with >=1 axe violation (for the CSV behind "37 of 598")
   const pagesWithAlfa = []; // URLs with >=1 alfa failure
@@ -782,31 +847,43 @@ function summarizeRecords(target, week, records, brokenLinks) {
       axeCountsPerPage.push(rec.axe.violationCount);
       if (rec.axe.violationCount > 0) { pagesWithAxeViolations++; pagesWithAxe.push(rec.url); }
       axeViolationTotal += rec.axe.violationCount;
+      axeContext ??= rec.axe.context ?? null;
+      if (rec.axe.element_evidence) axeEvidenceFailures++;
       for (const [id, v] of Object.entries(rec.axe.violations)) {
         const r = (axeRules[id] ??= { count: 0, pages: 0, impact: v.impact, help: v.help, helpUrl: v.helpUrl, tags: v.tags ?? [], examplePages: [], affectedPages: [], instances: [] });
         r.count += v.count;
         r.pages++;
         if (r.examplePages.length < 3) r.examplePages.push(rec.url);
         if (r.affectedPages.length < MAX_AFFECTED_PAGES) r.affectedPages.push({ url: rec.url, instances: v.count });
-        addInstances(r, rec.url, v.examples);
+        addInstances(r, rec, v.examples, rec.axe.version);
         clusterTracker.observe('axe-core', id, v.impact ?? null, rec.url, v.examples);
         componentTracker.observe('axe-core', id, rec.url, v.examples, v.count);
       }
     }
     if (rec.alfa) {
-      auditedPageIds.add(rec.pageId ?? rec.url);
-      alfaCountsPerPage.push(rec.alfa.failedCount);
-      if (rec.alfa.failedCount > 0) { pagesWithAlfaFailures++; pagesWithAlfa.push(rec.url); }
-      alfaFailedTotal += rec.alfa.failedCount;
-      for (const [id, v] of Object.entries(rec.alfa.failed)) {
-        const r = (alfaRules[id] ??= { count: 0, pages: 0, ruleUrl: v.ruleUrl, examplePages: [], affectedPages: [], instances: [] });
-        r.count += v.count;
-        r.pages++;
-        if (r.examplePages.length < 3) r.examplePages.push(rec.url);
-        if (r.affectedPages.length < MAX_AFFECTED_PAGES) r.affectedPages.push({ url: rec.url, instances: v.count });
-        addInstances(r, rec.url, v.examples);
-        clusterTracker.observe('alfa', id, null, rec.url, v.examples);
-        componentTracker.observe('alfa', id, rec.url, v.examples, v.count);
+      if (rec.alfa.skipped) {
+        alfaSkipped.push({
+          url: rec.url,
+          reason: rec.alfa.skippedReason ?? 'unknown',
+          elements: rec.alfa.pageSize?.elements ?? null,
+          text_length: rec.alfa.pageSize?.textLength ?? null,
+        });
+      } else {
+        auditedPageIds.add(rec.pageId ?? rec.url);
+        alfaCountsPerPage.push(rec.alfa.failedCount);
+        if (rec.alfa.failedCount > 0) { pagesWithAlfaFailures++; pagesWithAlfa.push(rec.url); }
+        alfaFailedTotal += rec.alfa.failedCount;
+        alfaEvidence ??= rec.alfa.element_evidence ?? null;
+        for (const [id, v] of Object.entries(rec.alfa.failed)) {
+          const r = (alfaRules[id] ??= { count: 0, pages: 0, ruleUrl: v.ruleUrl, examplePages: [], affectedPages: [], instances: [] });
+          r.count += v.count;
+          r.pages++;
+          if (r.examplePages.length < 3) r.examplePages.push(rec.url);
+          if (r.affectedPages.length < MAX_AFFECTED_PAGES) r.affectedPages.push({ url: rec.url, instances: v.count });
+          addInstances(r, rec, v.examples, rec.alfa.version);
+          clusterTracker.observe('alfa', id, null, rec.url, v.examples);
+          componentTracker.observe('alfa', id, rec.url, v.examples, v.count);
+        }
       }
     }
     if (rec.deprecatedHtml) {
@@ -816,7 +893,7 @@ function summarizeRecords(target, week, records, brokenLinks) {
         r.pages++;
         if (r.examplePages.length < 3) r.examplePages.push(rec.url);
         if (r.affectedPages.length < MAX_AFFECTED_PAGES) r.affectedPages.push({ url: rec.url, instances: v.count });
-        addInstances(r, rec.url, v.examples);
+        addInstances(r, rec, v.examples, null);
         clusterTracker.observe('deprecated-html', id, null, rec.url, v.examples);
         componentTracker.observe('deprecated-html', id, rec.url, v.examples, v.count);
       }
@@ -975,11 +1052,15 @@ function summarizeRecords(target, week, records, brokenLinks) {
       // Roll up failing audits into recommendations (like axe rules): one
       // entry per audit id, counting pages affected and summing savings.
       for (const a of rec.lighthouse.audits ?? []) {
-        const r = (lhReco[a.id] ??= { id: a.id, category: a.category, title: a.title, pages: 0, examplePages: [], savingsBytes: 0, savingsMs: 0 });
+        // Page records scanned before metrics were excluded still carry them.
+        if (LH_METRIC_AUDITS.has(a.id)) continue;
+        const r = (lhReco[a.id] ??= { id: a.id, category: a.category, title: a.title, pages: 0, examplePages: [], savingsBytes: 0, savingsMs: 0, byteValues: [], msValues: [] });
         r.pages++;
         if (r.examplePages.length < 10) r.examplePages.push(rec.url);
         r.savingsBytes += a.savingsBytes ?? 0;
         r.savingsMs += a.savingsMs ?? 0;
+        r.byteValues.push(a.savingsBytes ?? 0);
+        r.msValues.push(a.savingsMs ?? 0);
       }
     }
   }
@@ -992,6 +1073,13 @@ function summarizeRecords(target, week, records, brokenLinks) {
     pagesScanned > 0 && pagesWithAudit === 0 && dominantStatus
       ? { status: Number(dominantStatus) }
       : null;
+
+  // Where the findings sit, from the stored examples PR 1 records: by landmark
+  // region and by configured component / candidate widget. Computed once here
+  // so reports, the CSV and the API all read the same grouping.
+  const regionFindings = findingsFromRules({ axe: axeRules, alfa: alfaRules, deprecatedHtml: deprecatedRules });
+  const regions = regionFindings.length ? buildRegionGroups(regionFindings) : null;
+  const widgetGroups = regionFindings.length ? buildWidgetGroups(regionFindings) : null;
 
   return {
     domain: target.domain,
@@ -1014,18 +1102,27 @@ function summarizeRecords(target, week, records, brokenLinks) {
       pagesWithViolations: pagesWithAxeViolations,
       pagesScanned: axeCountsPerPage.length,
       medianViolations: axeCountsPerPage.length ? median(axeCountsPerPage) : null,
+      context: axeContext,
+      element_evidence: axeEvidenceFailures > 0 ? { status: 'unavailable', pages_failed: axeEvidenceFailures } : null,
       rules: axeRules,
     },
     alfa: {
       failedTotal: alfaFailedTotal,
       pagesWithFailures: pagesWithAlfaFailures,
       pagesScanned: alfaCountsPerPage.length,
+      skippedPages: alfaSkipped.length,
+      skipped: alfaSkipped.slice(0, 20),
       medianFailures: alfaCountsPerPage.length ? median(alfaCountsPerPage) : null,
+      element_evidence: alfaEvidence,
       rules: alfaRules,
     },
     // ACT-rule/page grouping for mapping overlap. Same-element duplicate
     // judgments are attached later to bug reports using observation evidence.
     consensus: buildConsensus(axeRules, alfaRules),
+    // Sample-based grouping of findings by page region and by component/widget.
+    // Null when there are no findings, so an empty week stays empty.
+    regions,
+    widgetGroups: widgetGroups?.groups?.length ? widgetGroups : null,
     sustainability: bytesList.length
       ? {
           pages: bytesList.length,
@@ -1145,8 +1242,14 @@ function summarizeRecords(target, week, records, brokenLinks) {
           pageDetail: lhPages, // per-sampled-page detail for the Lighthouse page (omitted from committed summary.json)
           // Aggregated non-accessibility recommendations, ranked by reach then
           // impact. Stored in the committed summary (compact, like axe rules).
-          recommendations: Object.values(lhReco).sort(
-            (a, b) => b.pages - a.pages || (b.savingsBytes + b.savingsMs * 1000) - (a.savingsBytes + a.savingsMs * 1000)
+          recommendations: Object.values(lhReco).map(({ byteValues, msValues, ...r }) => ({
+            ...r,
+            savingsBytesMedian: byteValues.length ? median(byteValues) : null,
+            savingsBytesP75: percentile(byteValues, 0.75),
+            savingsMsMedian: msValues.length ? median(msValues) : null,
+            savingsMsP75: percentile(msValues, 0.75),
+          })).sort(
+            (a, b) => b.pages - a.pages || (b.savingsBytesMedian ?? 0) - (a.savingsBytesMedian ?? 0)
           ),
         }
       : null,
@@ -1224,7 +1327,19 @@ function summarizeRecords(target, week, records, brokenLinks) {
       const componentClusters = clusterTracker.finalize(pagesScanned, target.reporting?.template_page_threshold ?? 10);
       const outside = actionIdsOutsideComponents(componentClusters.clusters, sharedComponents);
       if (outside) componentClusters.top_action_ids_outside_components = outside;
-      return { componentClusters, sharedComponents };
+      // Component grouping needs the shared-component model for verification
+      // provenance, so it is built here rather than with the region pass.
+      const componentGroups = regionFindings.length
+        ? buildComponentGroups(regionFindings, {
+            signatures: target.componentSignatures ?? [],
+            scopes: sharedComponents?.rules ?? null,
+          })
+        : null;
+      return {
+        componentClusters,
+        sharedComponents,
+        componentGroups: componentGroups?.groups?.length ? componentGroups : null,
+      };
     })(),
     pageFamilies: familyTracker.finalize(),
   };
@@ -1297,17 +1412,27 @@ function diffWeeks(prev, curr) {
 }
 
 // Keep a small, capped set of representative failing instances per rule
-// (page URL + element selector/snippet) so bug reports carry real DOM
-// context. Caps total per rule to keep summary.json small.
-function addInstances(rule, url, examples) {
+// (page URL, element selector/snippet, and the bounded element + semantic
+// evidence collected at scan time) so bug reports carry real DOM context.
+// Caps total per rule to keep summary.json small.
+function addInstances(rule, rec, examples, engineVersion) {
   if (!Array.isArray(examples)) return;
+  // The render context belongs to the page observation, not to a later page:
+  // each occurrence keeps its own copy so reports cannot borrow another run's.
+  const browserContext = pickBrowserContext(rec.axe?.context ?? rec.alfa?.context ?? null);
   for (const ex of examples) {
     if (rule.instances.length >= MAX_RULE_INSTANCES) break;
-    rule.instances.push({
-      url,
-      target: ex.target ?? null, // CSS selector (axe) / element description (alfa)
-      html: ex.html ?? null, // minimal failing markup (axe only)
-    });
+    rule.instances.push(condenseInstance({
+      ...ex,
+      url: rec.url,
+      page_id: rec.pageId ?? null,
+      run_id: rec.runId ?? null,
+      scanned_at: rec.scannedAt ?? null,
+      engine_version: engineVersion ?? null,
+      consent_state: rec.consent?.state ?? null,
+      browser_context: browserContext,
+      screenshot: rec.screenshot ?? null,
+    }));
   }
 }
 
@@ -1324,4 +1449,11 @@ function median(list) {
   const s = [...list].sort((a, b) => a - b);
   const mid = Math.floor(s.length / 2);
   return s.length % 2 ? s[mid] : Math.round((s[mid - 1] + s[mid]) / 2);
+}
+
+function percentile(list, p) {
+  if (!list.length) return null;
+  const s = [...list].sort((a, b) => a - b);
+  const index = Math.min(s.length - 1, Math.max(0, Math.ceil(p * s.length) - 1));
+  return s[index];
 }

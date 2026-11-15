@@ -108,6 +108,22 @@ export function lift(model, tech, finding, minPages = 5) {
 export const MIN_RATIO = 1.5;
 
 /**
+ * Approximate 95% confidence interval for the risk ratio (Katz log method).
+ * Used only to suppress pairs whose data are compatible with no difference; it
+ * is not a causal model and not a substitute for a controlled comparison.
+ */
+export function riskRatioCi(pairPages, techPages, withoutFindingPages, withoutPages) {
+  if (pairPages <= 0 || techPages <= 0 || withoutFindingPages <= 0 || withoutPages <= 0) return null;
+  if (pairPages > techPages || withoutFindingPages > withoutPages) return null;
+  const se = Math.sqrt(1 / pairPages - 1 / techPages + 1 / withoutFindingPages - 1 / withoutPages);
+  if (!Number.isFinite(se) || se <= 0) return null;
+  const rr = (pairPages / techPages) / (withoutFindingPages / withoutPages);
+  if (!Number.isFinite(rr) || rr <= 0) return null;
+  const log = Math.log(rr);
+  return [Math.exp(log - 1.96 * se), Math.exp(log + 1.96 * se)];
+}
+
+/**
  * Rank (tech, finding) pairs by how much more common the finding is on pages
  * with the tech than on pages without it:
  *
@@ -119,10 +135,12 @@ export const MIN_RATIO = 1.5;
  * and without the tech, and a ratio of at least `minRatio`. `ratio` is null
  * when the finding is never on a page without the tech. `lift` (against all
  * pages) stays for API consumers. Returns
- *   [{ tech, finding, ratio, lift, pairPages, techPages, findingPages, withoutPages, withoutFindingPages }]
- * strongest first. `limit` caps the result.
+ *   [{ tech, finding, ratio, ci_low, ci_high, certainty, lift, pairPages,
+ *      techPages, findingPages, withoutPages, withoutFindingPages }]
+ * strongest first. The approximate 95% risk-ratio interval suppresses pairs
+ * compatible with no difference (`minLower`); it is not a causal model. `limit` caps the result.
  */
-export function rankAssociations(model, { minPages = 5, minRatio = MIN_RATIO, limit = 50 } = {}) {
+export function rankAssociations(model, { minPages = 5, minRatio = MIN_RATIO, minLower = 1, limit = 50 } = {}) {
   const out = [];
   for (const tech of Object.keys(model.pair)) {
     for (const finding of Object.keys(model.pair[tech])) {
@@ -135,10 +153,15 @@ export function rankAssociations(model, { minPages = 5, minRatio = MIN_RATIO, li
       const withoutFindingPages = findingPages - pairPages;
       const ratio = withoutFindingPages > 0 ? (pairPages / techPages) / (withoutFindingPages / withoutPages) : null;
       if (ratio != null && ratio < minRatio) continue;
+      const ci = ratio == null ? null : riskRatioCi(pairPages, techPages, withoutFindingPages, withoutPages);
+      if (ci && ci[0] < minLower) continue;
       out.push({
         tech,
         finding,
         ratio: ratio == null ? null : Math.round(ratio * 100) / 100,
+        ci_low: ci == null ? null : Math.round(ci[0] * 100) / 100,
+        ci_high: ci == null ? null : Math.round(ci[1] * 100) / 100,
+        certainty: ci == null ? 'no_comparison' : ci[0] >= 1 ? 'ci_above_one' : 'ci_includes_one',
         lift: Math.round(lift(model, tech, finding, minPages) * 100) / 100,
         pairPages,
         techPages,
@@ -208,30 +231,19 @@ export function mergeFleet(entries) {
 }
 
 /**
- * Rank fleet pairs by a systemic score that rewards both strong association
- * (lift) and breadth across sites: score = lift × sitesAffected. Only pairs
- * present on >= minSites distinct domains are returned, so single-site
- * coincidences don't dominate. Returns
- *   [{ tech, finding, lift, sites, pairPages, score }]
+ * Rank fleet pairs the way rankAssociations ranks one site's: the finding must
+ * be at least `minRatio` times as common on pages with the technology as on
+ * pages without it, with an approximate 95% interval above 1, and the pair
+ * must be on at least `minSites` domains. Lift against all pages said nothing
+ * here: a technology on nearly every page scored 1.00× with every finding and
+ * filled the dashboard table. Ordered by sites, then strength. Returns the
+ * rankAssociations fields plus `sites`.
  */
-export function rankFleetAssociations(fleet, { minPages = 5, minSites = 2, limit = 50 } = {}) {
-  const out = [];
-  for (const tech of Object.keys(fleet.pair)) {
-    for (const finding of Object.keys(fleet.pair[tech])) {
-      const sites = fleet.pairSites[tech]?.[finding] ?? 0;
-      if (sites < minSites) continue;
-      const l = lift(fleet, tech, finding, minPages);
-      if (l == null) continue;
-      out.push({
-        tech,
-        finding,
-        lift: Math.round(l * 100) / 100,
-        sites,
-        pairPages: fleet.pair[tech][finding],
-        score: Math.round(l * sites * 100) / 100,
-      });
-    }
-  }
-  out.sort((a, b) => b.score - a.score || b.sites - a.sites);
-  return out.slice(0, limit);
+export function rankFleetAssociations(fleet, { minPages = 5, minSites = 2, minRatio = MIN_RATIO, limit = 50 } = {}) {
+  const strength = (a) => a.ratio ?? Infinity;
+  return rankAssociations(fleet, { minPages, minRatio, limit: Infinity })
+    .map((a) => ({ ...a, sites: fleet.pairSites[a.tech]?.[a.finding] ?? 0 }))
+    .filter((a) => a.sites >= minSites)
+    .sort((a, b) => b.sites - a.sites || strength(b) - strength(a) || b.pairPages - a.pairPages)
+    .slice(0, limit);
 }

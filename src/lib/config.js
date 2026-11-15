@@ -6,6 +6,10 @@ import { DEFAULT_FINDING_POLICY, mergeFindingPolicy, validateFindingPolicy } fro
 import { resolveComponentSignatures } from './shared-components.js';
 import { resolvePageFamilies } from './page-families.js';
 import { resolveConsentHandling } from '../engines/consent-action.js';
+import { resolveScreenshotConfig } from './screenshots.js';
+import { resolveTargetRetention } from './retention-policy.js';
+import { resolveStorageLimits } from './storage-guard.js';
+import { governmentDomain } from '../engines/security.js';
 
 const ROOT = path.resolve(new URL('../..', import.meta.url).pathname);
 const DESIGN_SYSTEMS = new Set(['none', 'cms-ds', 'uswds']);
@@ -56,6 +60,11 @@ export function loadConfig(rawYaml) {
   const sampling = cfg.sampling ?? {};
   // Report display preference: 'co2' (default) or 'energy'.
   const sustainabilityMetric = cfg.sustainability_metric === 'energy' ? 'energy' : 'co2';
+  // ParaCharts progressive enhancement is opt-in: the vendored runtime is
+  // 2.8 MB and currently fails on every chart vital-core draws (see
+  // FEATURES.md), so by default pages ship only the static SVG + data table.
+  const interactiveCharts = cfg.interactive_charts ?? false;
+  if (typeof interactiveCharts !== 'boolean') throw new Error('interactive_charts must be true or false.');
   // Localization: which languages each report is rendered in, and which one
   // gets the canonical (unsuffixed) file paths. Global default here; per-target
   // `languages` / `default_language` keys override.
@@ -69,10 +78,32 @@ export function loadConfig(rawYaml) {
   // exports). Trailing slash stripped so callers can always do `${base}${path}`.
   const reportBaseUrl = (cfg.report_base_url || '').replace(/\/+$/, '');
   const dataRepo = validateDataRepo(cfg.data_repo ?? DEFAULT_DATA_REPO, 'global config');
-  const targets = (cfg.targets ?? []).map((t) => ({ ...defaults, ...t }));
-  for (const t of targets) {
+  const storageLimits = resolveStorageLimits(cfg.storage ?? {});
+  const globalEvaluationReport = cfg.evaluation_report ?? defaults.evaluation_report ?? null;
+  if (globalEvaluationReport != null && !EVALUATION_REPORTS.includes(globalEvaluationReport)) {
+    throw new Error(`evaluation_report must be openacr, wcag-em or both (got ${JSON.stringify(globalEvaluationReport)})`);
+  }
+  const rawTargets = cfg.targets ?? [];
+  const globalRetention = defaults.retention ?? cfg.retention ?? null;
+  const targets = rawTargets.map((t) => ({ ...defaults, ...t }));
+  for (const [index, t] of targets.entries()) {
+    const rawTarget = rawTargets[index] ?? {};
     if (!t.domain) throw new Error('Every target needs a `domain` key.');
     t.reporting = { ...(defaults.reporting ?? {}), ...(t.reporting ?? {}) };
+    const ignoreParams = t.url_ignore_params ?? [];
+    if (!Array.isArray(ignoreParams) || ignoreParams.some((name) => typeof name !== 'string' || !name.trim())) {
+      throw new Error(`target ${t.domain}: url_ignore_params must be a list of non-empty query parameter names`);
+    }
+    t.urlIgnoreParams = [...new Set(ignoreParams.map((name) => name.trim()))];
+    const retention = resolveTargetRetention({
+      defaultsRetention: globalRetention,
+      targetRetention: rawTarget.retention ?? null,
+      legacyWeeks: t.retention_weeks ?? null,
+    });
+    t.retentionPolicy = retention.policy;
+    t.retentionSource = retention.source;
+    t.retentionWarnings = retention.warnings;
+    for (const warning of retention.warnings) console.warn(`[config] ${t.domain}: ${warning}`);
     t.key = domainKey(t.domain);
     const langs = resolveLanguages(t.languages, t.default_language, `target ${t.domain}`, globalLangs);
     t.languages = langs.languages;
@@ -82,6 +113,13 @@ export function loadConfig(rawYaml) {
     // language switcher above — only a literal `true` enables it, so an
     // unset or misconfigured flag never silently ships client-side JS.
     t.webmcpEnabled = t.webmcp === true;
+    // Unlisted sites are still scanned and their reports still built at the
+    // same URLs; nothing site-wide links to them. A non-boolean is an error,
+    // not a silent "listed", so a typo can't publish a site meant to be quiet.
+    if (t.unlisted != null && typeof t.unlisted !== 'boolean') {
+      throw new Error(`unlisted in target ${t.domain} must be true or false.`);
+    }
+    t.unlisted = t.unlisted === true;
     // hf_only (VA) data is gitignored on purpose: pages can capture CSRF/OAuth
     // tokens. Sending it to any git repo is a separate owner decision.
     if (t.data_repo != null && t.hf_only) {
@@ -105,7 +143,13 @@ export function loadConfig(rawYaml) {
     }
     t.spelling_locale = resolveSpellingLocale(t.spelling_locale, `target ${t.domain}`);
     t.governmentDomains = resolveGovernmentDomains(t.government_domains, `target ${t.domain}`);
+    t.evaluationReport = t.evaluation_report ?? globalEvaluationReport ?? defaultEvaluationReport(t.domain, t.governmentDomains);
+    if (!EVALUATION_REPORTS.includes(t.evaluationReport)) {
+      throw new Error(`target ${t.domain}: evaluation_report must be openacr, wcag-em or both`);
+    }
     t.pdfAudit = resolvePdfAudit({ ...(defaults.pdf_audit ?? {}), ...(t.pdf_audit ?? {}) }, `target ${t.domain}`);
+    // Historical screenshots are opt-in and bounded; off unless a target asks.
+    t.screenshots = resolveScreenshotConfig({ ...(defaults.screenshots ?? {}), ...(t.screenshots ?? {}) }, `target ${t.domain}`);
     // Both are opt-in and data-only; a target's list replaces the global default.
     t.componentSignatures = resolveComponentSignatures(t.component_signatures ?? defaults.component_signatures, `target ${t.domain}`);
     t.pageFamilies = resolvePageFamilies(t.page_families ?? defaults.page_families, `target ${t.domain}`);
@@ -116,13 +160,27 @@ export function loadConfig(rawYaml) {
     findingPolicy: mergeFindingPolicy(globalFindingPolicy, {}),
     sampling,
     sustainabilityMetric,
+    interactiveCharts,
     languages: globalLangs.languages,
     defaultLanguage: globalLangs.defaultLanguage,
     showLanguageSwitcher: globalShowSwitcher,
     reportBaseUrl,
     dataRepo,
+    storageLimits,
     targets,
   };
+}
+
+const EVALUATION_REPORTS = ['openacr', 'wcag-em', 'both'];
+const US_COUNTRY_NAMES = new Set(['united states', 'united states of america', 'us', 'usa']);
+
+// OpenACR is a US procurement format; elsewhere the W3C WCAG-EM report is the
+// recognised website evaluation. Unless a fleet chooses, only a site in a US
+// government namespace (built in, or a government_domains entry naming the
+// United States) gets OpenACR.
+export function defaultEvaluationReport(domain, governmentDomains = []) {
+  const country = String(governmentDomain(domain, governmentDomains)?.country ?? '').trim().toLowerCase().replace(/\./g, '');
+  return US_COUNTRY_NAMES.has(country) ? 'openacr' : 'wcag-em';
 }
 
 function validateDataRepo(repo, where) {
@@ -204,6 +262,35 @@ export function resolveLanguages(langsRaw, defaultRaw, where, fallback) {
 /** Filesystem-safe identifier for a domain. Stable across runs. */
 export function domainKey(domain) {
   return domain.toLowerCase().replace(/^https?:\/\//, '').replace(/\/+$/, '').replace(/[^a-z0-9.-]/g, '_');
+}
+
+/**
+ * Resolve a CLI target name leniently.
+ *
+ * Accepts an exact key/domain, or a parent domain when it identifies exactly
+ * one target (e.g. "example.gov" -> "www.example.gov"). Ambiguous bare domains
+ * list the choices instead of guessing; a typo lists configured keys.
+ */
+export function resolveTargetQuery(config, query) {
+  const normalized = String(query ?? '').trim().toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/\/+$/, '');
+  const targets = config.targets ?? [];
+  if (!normalized) throw new Error('A target domain or key is required');
+  const exact = targets.filter((target) => target.key === normalized || target.domain.toLowerCase() === normalized);
+  if (exact.length === 1) return exact[0];
+  if (exact.length > 1) {
+    throw new Error(`Target "${query}" is ambiguous: ${exact.map((target) => target.key).join(', ')}`);
+  }
+  const parentMatches = targets.filter((target) => {
+    const domain = target.domain.toLowerCase();
+    return domain.endsWith(`.${normalized}`) || `www.${normalized}` === domain;
+  });
+  if (parentMatches.length === 1) return parentMatches[0];
+  if (parentMatches.length > 1) {
+    throw new Error(`Target "${query}" is ambiguous. Use one of: ${parentMatches.map((target) => target.key).join(', ')}`);
+  }
+  throw new Error(`Unknown target "${query}". Configured keys: ${targets.map((target) => target.key).join(', ')}`);
 }
 
 export function getTarget(config, domainOrKey) {
