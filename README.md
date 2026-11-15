@@ -32,11 +32,18 @@ functions of the data directory.**
 - `data/<domain>/<ISO-week>/runs/*.json`: append-only run logs.
 - `data/<domain>/<ISO-week>/summary.json`: the weekly rollup, computed
   from the page records and committed. Old page-level detail is pruned
-  after `retention_weeks`; summaries are kept forever, so trend history
+  only by the verified, explicitly authorized retention command; summaries are kept forever, so trend history
   never breaks.
 - `docs/`: generated HTML, built at deploy time and shipped as a Pages
   artifact. **Never committed.** It cannot drift from the data because
   it does not persist.
+
+## Retention
+
+Automatic pruning is disabled. Page-level detail can only be removed by the
+verified, explicitly confirmed retention command. See
+[docs-internal/RETENTION-RUNBOOK.md](docs-internal/RETENTION-RUNBOOK.md) and
+[docs-internal/RETENTION-ADR.md](docs-internal/RETENTION-ADR.md).
 
 Other deliberate choices:
 
@@ -70,6 +77,13 @@ Other deliberate choices:
   shared across both pages, and exportable/importable so a team can agree on
   one scope. Scanning is unaffected — it only changes what the report shows;
   with JavaScript off the full report renders.
+- **Unlisted sites.** `unlisted: true` on a target in `config/targets.yml`
+  takes it off the published site without touching the crawl: it is still
+  scanned and its history kept, and its reports are still built at the same
+  URLs (marked `noindex`), but the dashboard, fleet-wide tables, URL lookup,
+  JSON API and archive indexes, `llms.txt` and weekly issue comment leave
+  it out. Anyone with a link can still open it. Delete the line to list it
+  again.
 - **Plain Node, no build step, no TypeScript, six dependencies.** Less
   machinery to break in CI.
 
@@ -83,7 +97,7 @@ Other deliberate choices:
    pages/domain/week, within the `max_pages_per_week` cap.
 3. After the night's scans finish, the `report` workflow aggregates the
    week, deploys the reports to GitHub Pages, and prunes page-level
-   detail older than `retention_weeks`.
+   detail older than a verified retention policy. Automatic pruning is disabled.
 4. Optionally, the `pdf-audit` workflow checks the PDFs each site links to
    (daily, for sites with `pdf_audit: { enabled: true }`, or for one site
    from Actions → pdf-audit), and the next report shows them on that
@@ -239,6 +253,11 @@ Tests:
 ```sh
 npm run test:unit   # URL identity, ISO weeks, robots.txt, batch picking
 npm run test:e2e    # full pipeline over a local fixture site simulating two weeks
+npm run retention:plan -- --domain example.gov   # read-only retention/storage plan
+npm run retention:prune-check -- --domain example.gov   # read-only archive coverage check
+npm run retention:prune -- --domain example.gov         # dry-run; --execute is explicit
+npm run retention:archive -- --domain example.gov --week 2026-W44   # dry-run ZIP + manifest
+# archive states: npm run aggregate → reports/<domain>/<week>/archive.html + evidence.html
 ```
 
 ## Languages
@@ -320,11 +339,12 @@ This project follows public commitments to
 [W3C Web Sustainability Guidelines](https://w3c.github.io/sustainableweb-wsg/).
 The reports themselves are part of the argument: semantic HTML, no
 web fonts, ~2 KB of CSS, dark mode respected. They work fully without
-JavaScript — every chart renders as a static SVG with a data-table
-fallback. Where JavaScript is available, charts are progressively
-enhanced into interactive, keyboard- and screen-reader-navigable
-[ParaCharts](https://github.com/fizzstudio/ParaCharts), vendored and
-served first-party (no CDN).
+JavaScript — every chart renders as a static SVG with a data table.
+Interactive, keyboard- and screen-reader-navigable
+[ParaCharts](https://github.com/fizzstudio/ParaCharts) are vendored and
+served first-party (no CDN) but off by default (`interactive_charts` in
+`config/targets.yml`): the vendored 2.8 MB build fails on the charts the
+reports draw, so it would cost every reader the download for nothing.
 
 ## License
 

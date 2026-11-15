@@ -523,3 +523,25 @@ at the default `per_run: 25` takes about eight months. The setting works per
 target, so a fleet can raise it. Document the trade-off between load on the
 site and coverage, and perhaps show "N days to first full pass" on the PDFs
 page.
+
+## 15. A unit test asserts the *fleet* spelling allowlist
+
+Recorded 2026-11-15. **Status: filed**, not yet fixed in vital-core.
+
+`tests/unit/lib.test.js` ("spell: flags real misspellings, skips
+numbers/acronyms/allowlist/jargon") expects `Medicaid` and `telehealth` to be
+allowlisted, and `findMisspellings()` loads `config/spelling-allowlist.txt` —
+a **fleet file**. Trimming the CMS program terms from the NSF list (they are
+medical-insurance words) made that test fail with 5 misspellings instead of 3.
+
+`config/spelling-allowlist.txt` is fleet-owned by the same rule as
+`config/targets.yml`, so a test that depends on its contents cannot pass in
+every fleet. **Suggested fix:** put the fixture terms in the test (or a
+`tests/fixtures/` allowlist) and assert against that, and keep exactly one
+test that the real allowlist parses (one term per line, no spaces). Fleets
+may then trim or extend their list without breaking the engine's suite.
+
+This was worked around here by *keeping* the CMS terms and appending NSF
+jargon, rather than editing the test — the same way the `www.cms.gov`
+expectations in `tests/unit/config.test.js` were handled before upstream made
+those targets generic.

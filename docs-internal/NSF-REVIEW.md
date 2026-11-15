@@ -33,6 +33,37 @@ PR and merged with **"Create a merge commit"**. A squash or rebase merge
 drops the link to upstream, and the next merge then conflicts. Upstream fixes
 are made in vital-core first (CLAUDE.md, "Fleets made from this template").
 
+## Status at 2026-11-15
+
+Synced to `vital-core` through `5fe1925` (150 commits,
+[#17](https://github.com/mgifford/vital-core-nsf/pull/17)). That is the same
+engine `vital-core-lgd` runs: evidence and inspection surfaces (findings
+explorer, live highlight, reproduction, ARRM roles, manual validation,
+coverage), retention and storage guards, WCAG-EM and OpenACR exports,
+profiles, screenshots (off by default), source-mapped MCP.
+
+**Why CI had been red since 2026-11-13.** `ubuntu-latest` moved to Ubuntu
+26.04, and Playwright 1.60 refuses to install Chromium there
+("Playwright does not support chromium on ubuntu26.04-x64"). Every job that
+launches a browser — `scan`, `tests`, `diagnose`, `spec-kitty-governance` —
+died at `npx playwright install`, before scanning anything. Upstream had
+already pinned `ubuntu-24.04`; the merge brings the pins, so no fleet-side
+workflow edit was needed.
+
+**Fleet files added or changed in #17** (never sent upstream):
+
+| File | Why |
+|---|---|
+| `config/profiles/nsf.yml` | Brand the published report "NSF Accessibility & Sustainability" (mirrors `lgd.yml`). |
+| `.github/workflows/report.yml` | `VITAL_PROFILE: nsf` on Aggregate, as LGD does. |
+| `config/spelling-allowlist.txt` | NSF program jargon (NCSES, EPSCoR, CAREER, GRFP, REU, IUCrC, SBIR/STTR, proposer/awardee, …). |
+| `config/targets.yml` | Adopt merged defaults; keep pdf-audit; set `evaluation_report: openacr` (US federal). |
+
+**US, not UK.** The engine defaults are still US CMS's: Section 508
+(WCAG 2.0 AA) legal baseline, WCAG 2.2 AA target, `en-US` spelling. Nothing
+from LGD's UK framing (EN 301 549, `en-GB`, WCAG-EM as the default export) is
+copied across.
+
 **PDF checks: what to expect.** At 2026-W44 the sites link to 6,481 PDFs on
 NSF's own domain:
 
@@ -149,8 +180,10 @@ whether the steps went green.
 
 - `git fetch upstream main && git log origin/main..upstream/main` is empty:
   NSF has every vital-core commit.
-- `git diff upstream/main origin/main -- . ':!config/targets.yml' ':!docs-internal/NSF-REVIEW.md' ':!docs-internal/UPSTREAM-SUGGESTIONS.md'`
-  is empty: the engine is identical to vital-core.
+- `git diff upstream/main origin/main -- . ':!config/targets.yml' ':!config/profiles/' ':!config/spelling-allowlist.txt' ':!.github/workflows/report.yml' ':!docs-internal/NSF-REVIEW.md' ':!docs-internal/UPSTREAM-SUGGESTIONS.md'`
+  is empty: the engine is identical to vital-core. The excluded paths are
+  fleet files; `config/profiles/nsf.yml`, the `VITAL_PROFILE` line in
+  `report.yml`, and the NSF allowlist terms are expected to differ.
 - The last scheduled `scan` and `report` runs succeeded, and the data repo
   has new commits.
 - No open PRs from the session in either repo, and `main` is the only branch
